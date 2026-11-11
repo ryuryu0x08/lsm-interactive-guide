@@ -11,7 +11,7 @@
   }
   function render() {
     const cur = current(), i = CH.indexOf(cur); main.textContent = '';
-    const art = h('article', null, h('h1', null, (cur.n === '★' ? '' : `第 ${cur.n} 章 `) + cur.title));
+    const art = h('article', null, h('h1', null, (isNaN(parseInt(cur.n, 10)) ? '' : `第 ${cur.n} 章 `) + cur.title));
     add(main, art);
     try { cur.render(art); } catch (e) { add(art, h('pre', null, '渲染出错：' + (e && e.stack ? e.stack : e))); }
     add(art, h('div', { class: 'pager' }, i > 0 ? h('a', { href: '#' + CH[i - 1].id }, '← ' + CH[i - 1].title) : h('span'), i < CH.length - 1 ? h('a', { href: '#' + CH[i + 1].id }, CH[i + 1].title + ' →') : h('span')));

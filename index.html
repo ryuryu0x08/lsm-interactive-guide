@@ -1390,7 +1390,7 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
       add(el, h('div', { class: 'axis' }, h('div', { class: 'lvl-head', style: 'color:var(--muted)' }, 'key 范围 →'), ax));
       const old = db.obsoletePinned();
       if (old.length) add(el, h('div', { class: 'bar' }, h('span', { style: 'font-size:12px;color:var(--ink2)' }, '已被 compaction 淘汰、但仍被旧版本引用而不能删除的文件：'), old.map((f) => h('span', { class: 'file old' }, '#' + f.id))));
-      if (o.legend) add(el, h('div', { class: 'legend', html: '<span><i></i>SST 文件（横向位置和宽度 = key 范围）</span><span><i style="border-color:var(--in);background:var(--in-soft)"></i>compaction 输入</span><span><i style="border-color:var(--probe);background:var(--probe-soft)"></i>输出层中重叠的文件 / 当前访问</span><span><i style="border-color:var(--out);background:var(--out-soft)"></i>新生成 / 命中</span><span><i style="border-color:var(--bad);background:var(--bad);height:3px;vertical-align:2px"></i>底部红条 = tombstone 占比</span>' }));
+      if (o.legend) add(el, h('div', { class: 'legend', html: typeof o.legend === 'string' ? o.legend : '<span><i></i>SST 文件（横向位置和宽度 = key 范围）</span><span><i style="border-color:var(--in);background:var(--in-soft)"></i>compaction 输入</span><span><i style="border-color:var(--probe);background:var(--probe-soft)"></i>输出层中重叠的文件 / 当前访问</span><span><i style="border-color:var(--out);background:var(--out-soft)"></i>新生成 / 命中</span><span><i style="border-color:var(--bad);background:var(--bad);height:3px;vertical-align:2px"></i>底部红条 = tombstone 占比</span>' }));
       if (o.inspector) { this.inspEl.textContent = ''; if (this.selFile && db.disk.has(this.selFile.id)) add(this.inspEl, fileInspector(db, this.selFile, () => { this.selFile = null; this.render(); })); add(el, this.inspEl); }
     }
     _mark(tr) { if (this.hl.key) add(tr, h('div', { class: 'keymark', style: `left:${this.pct(this.hl.key)}%` })); }
@@ -1576,13 +1576,39 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
   // ================= 2. 写路径 =================
   CH.push({ id: 'write', n: '2', title: '写路径：WAL 与 MemTable', quizN: 4, render(root) {
     prose(root, `
-<p class="lead">一次写入经过四步：分配 sequence number、追加 WAL、插入 MemTable、检查 MemTable 是否写满。这一章逐步执行每一步。</p>
-<h2>内部 key</h2>
-<p>RocksDB 存储的不是用户给的 key，而是内部 key：<code>user_key + sequence number（56 位）+ type（8 位）</code>。sequence number 是全局递增的整数，每个写操作占一个。type 区分 Put、Delete、Merge 等。</p>
-<p>排序规则是：user key 升序；user key 相同时 sequence number 降序。所以同一个 key 的最新版本总是排在最前面。下文把内部 key 写成 <code>k005@12</code>，表示 user key 为 k005、seq 为 12。</p>
-<p>Delete 不会去找到旧数据并抹掉，它只是写入一条 type 为 Delete 的记录，称为 tombstone。读取时遇到 tombstone 就知道这个 key 已被删除。</p>
+<p class="lead">第 1 章的小模型里，一次写入是"日志追加一行、内存表插入一条"。RocksDB 做的是同一件事，但小模型省略了几个必须回答的问题。这一章先逐个说明这些问题和 RocksDB 的做法，再用实验单步执行一次真实的写入。</p>
+
+<h2>问题一：同一个 key 写了多次，怎么分清新旧</h2>
+<p>小模型里，对同一个 key 再写一次，内存表里的旧值直接被换掉。真实系统不能这样做，原因有两个：同一个 key 的不同值会分散在内存表和多个文件里，合并时必须知道谁更新；另外有些读操作需要看到"稍早时刻"的数据（第 5 章），旧值不能立刻消失。</p>
+<p>RocksDB 的做法是给<b>每一次写操作一个全局递增的编号</b>，叫 <b>sequence number</b>（下文简称 seq）。编号越大越新。实际存下来的 key 不是你给的 key，而是三部分拼在一起：</p>
+<p><code>你给的 key</code> + <code>seq</code> + <code>类型</code></p>
+<p>这个拼起来的东西叫<b>内部 key</b>。下文把它写成 <code>k005@12</code>，意思是 key 为 k005、seq 为 12。类型用来区分这是一次写入（Put）还是一次删除（Delete，也就是第 1 章的删除标记，正式名字叫 tombstone）。</p>
+<p>排序规则：先按你给的 key 从小到大；key 相同的，seq 大的排前面。这样同一个 key 的各个版本挨在一起，并且最新的排在最前，查找时遇到的第一个就是最新的。</p>
+<p>由此得到一个重要的性质：<b>内存表里的记录只增不改</b>。更新一个 key 是插入一条 seq 更大的新记录，删除一个 key 是插入一条类型为 Delete 的记录。</p>
+
+<h2>问题二：为什么先写日志，再写内存表</h2>
+<p>日志的作用是断电后重建内存表。所以规则很简单：一条数据必须先进日志，才能进内存表。如果顺序反过来，就可能出现"内存表里有、日志里没有"的数据，断电后它无法恢复。</p>
+<p>这里的日志就是 <b>WAL</b>。还有一个细节：程序"写文件"时，数据先到操作系统的缓存里，操作系统稍后才真正写到磁盘。要强制立刻落盘，需要额外调用一次 <code>fsync</code>，它比较慢。RocksDB 默认每次写入<b>不</b>做 fsync，因此：</p>
+<ul><li>RocksDB 进程崩溃：数据在操作系统缓存里，不会丢。</li><li>整台机器断电：最近一小段还没落盘的写入会丢。</li></ul>
+<p>如果不能接受后一种情况，可以在写入时指定 <code>sync=true</code>，代价是每次写入都慢得多。</p>
+
+<h2>问题三：内存表用什么数据结构</h2>
+<p>内存表要保持有序，要能在任意位置快速插入，还要允许一边写一边读。</p>
+<ul><li>有序数组：查找快，但在中间插入要挪动后面所有元素。</li><li>平衡树：插入快，但插入时可能要调整树的形状，多个线程同时操作需要加锁。</li></ul>
+<p>RocksDB 默认用<b>跳表</b>。它的最底层是一条按顺序连起来的链表。在此之上，一部分节点还有第 2 层、第 3 层……的指针，层数越高的指针一次跨过的节点越多。每个节点有几层是插入时随机决定的：每多一层的概率是 1/4，所以高的节点很少。</p>
+<p>查找或插入时，从最高层出发向右走；如果下一个节点已经比目标大，就下降一层继续。这样可以先用高层指针跨过大段节点，再用低层指针走到精确位置。插入只需要改动少数几个指针，不需要整体调整，所以多个线程可以同时插入。</p>
+<p>实验里会画出跳表：每一列是一个节点，列的高度是它的层数，蓝色标出一次插入时查找经过的节点。</p>
+
+<h2>问题四：内存表写满时，写入要不要停下来等</h2>
+<p>把一个 64MB 的内存表写成文件需要时间。如果写入要等它写完，延迟就会周期性地变得很高。RocksDB 的做法是：</p>
+<ol><li>把写满的内存表<b>冻结</b>，变成只读。它的正式名字是 <b>immutable MemTable</b>。</li><li>立刻新建一个空的内存表，后续写入进入新表，不需要等待。</li><li>后台线程把冻结的内存表写成 SST 文件，这个动作叫 <b>flush</b>。写完后冻结的内存表才从内存里释放。</li></ol>
+<p>冻结期间它的数据仍然可以被读到：查找时先看当前内存表，再看冻结的内存表。</p>
+<p>日志也跟着切换：每个内存表对应一个自己的日志文件，冻结时同时开始写一个新的日志文件。这样做的好处是，等某个冻结的内存表 flush 完成，它对应的那个日志文件就整个没用了，可以直接删除，不需要从一个大日志里挑出哪些行还有用。</p>
+<p>如果写入太快、flush 来不及，冻结的内存表会越积越多，占用内存。所以有一个上限 <code>max_write_buffer_number</code>：等待 flush 的内存表达到这个数量时，写入必须停下来等。单个内存表的大小上限是 <code>write_buffer_size</code>。</p>
+
 <h2>实验：单步执行一次写入</h2>
-<p>这个实验关闭了后台线程，flush 需要你手动触发，这样可以看清每个状态。MemTable 上限设为 120 字节（约 6 条）。</p>`);
+<p>这个实验关闭了后台线程，flush 需要你手动触发，这样可以看清每个状态。MemTable 上限设为 120 字节（约 6 条）。</p>
+<p>图的看法：紫色框是当前的 WAL 文件，黄色框是当前的 MemTable，虚线框是冻结的 MemTable。再往下的 L0、L1、L2 是磁盘上的各层，这一章只需要看 L0，flush 出来的文件会出现在那里。</p>`);
     const tasks = U.taskList('按顺序完成：', [
       { text: '写入任意一条数据，用"下一步"看完四个步骤', check: (B) => B.lab.db.seq >= 1 },
       { text: '对同一个 key 再 Put 一次，观察跳表里出现两个版本，新的排在前面', check: (B) => { const es = B.lab.db.mem.list.toArray(); return es.some((e, i) => i > 0 && es[i - 1].k === e.k); } },
@@ -1591,7 +1617,7 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
       { text: '继续写，直到写入被拒绝，阅读拒绝原因', check: (B) => B.lab.db.stats.rejected > 0 },
       { text: '点 Flush，观察 immutable MemTable 变成 L0 文件、旧 WAL 被删除', check: (B) => B.lab.db.stats.flushes > 0 },
     ]);
-    const B = U.bench('写入一条数据', { opts: { sim_bg_mode: 'manual', write_buffer_size: 120, num_levels: 3 }, view: { keySpace: 100 }, tasks });
+    const B = U.bench('写入一条数据', { opts: { sim_bg_mode: 'manual', write_buffer_size: 120, num_levels: 3 }, view: { keySpace: 100, plain: true, legend: false }, tasks });
     const kIn = B.input('key', '5', 56), vIn = B.input('value', 'hello', 70); let showPath = null; const skipBox = h('div'), stepBox = h('div'), walBox = h('div');
     add(B.extra, [stepBox, h('div', null, h('div', { style: 'font-size:12.5px;font-weight:600' }, '当前 MemTable 的跳表（每列是一个节点，高度是它的层数）'), skipBox), walBox]);
     B.onRefresh = () => {
@@ -1621,7 +1647,7 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
     B.btn('Flush（后台线程的工作）', () => { stepBox.textContent = ''; showPath = null; const r = B.act({ t: 'flush' }); B.say(r ? `flush 完成：把 MemTable 中的 ${r.files.reduce((s, f) => s + f.numEntries, 0)} 条数据按内部 key 顺序写成 L0 文件 ${r.files.map((f) => '#' + f.id).join('、')}。点击文件可以看内容。` : '没有可以 flush 的数据。'); });
     add(root, B.el); B.refresh();
     prose(root, `
-<h2>四个步骤的要点</h2>
+<h2>补充细节</h2>
 <h3>WAL</h3>
 <p>WAL 的每条记录是一个 WriteBatch：起始 sequence number、操作个数、每个操作的类型和 key/value。记录按 32KB 的块切分，每个分片带 CRC。WAL 的作用只有一个：进程崩溃后，重放它可以重建还没 flush 的 MemTable（第 5 章）。</p>
 <p>是否 fsync 由每次写入的 <code>WriteOptions.sync</code> 决定。不 fsync 时，进程崩溃不丢数据（数据在内核页缓存里），机器掉电会丢最近的写入。</p>
@@ -1653,13 +1679,23 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
   const readOpts = { num_levels: 5, level_compaction_dynamic_level_bytes: false, max_bytes_for_level_multiplier: 4, max_bytes_for_level_base: 512, target_file_size_base: 160, block_size: 64, block_cache_blocks: 6 };
   CH.push({ id: 'read', n: '4', title: '读路径：点查与迭代器', quizN: 4, render(root) {
     prose(root, `
-<p class="lead">读取要在多个位置中找到一个 key 的最新可见版本。查找顺序是从新到旧：MemTable、immutable MemTable、L0 的每个文件、L1 及以下每层一个文件。找到第一个结果就停止。</p>
-<h2>为什么这个顺序是对的</h2>
-<p>LSM 保证：对同一个 key，较新的版本总在较"上面"的位置。MemTable 比所有 SST 新；L0 文件之间按 flush 顺序排列，新文件在前；Ln 的数据总是比 Ln+1 中相同 key 的数据新，因为数据只能从上层向下层移动。所以从上到下遇到的第一个版本就是最新版本，不需要再往下看。</p>
-<p>L0 和其他层有一个重要区别：L0 的文件由 flush 直接生成，key 范围互相重叠，所以点查要逐个检查。L1 及以下每层内部的文件 key 范围不重叠且有序，可以二分定位到唯一的候选文件。</p>
+<p class="lead">第 1 章的小模型里，查找是"先看内存表，再从新到旧看每个文件"。RocksDB 的做法相同，只是有了分层之后可以少看很多文件。这一章跟踪一次查找实际读了哪些地方，并说明是哪些机制让它少读。</p>
+<h2>查找的顺序</h2>
+<p>查一个 key（这个操作叫 Get，也叫点查）时，依次看下面这些地方，<b>找到第一个结果就停止</b>：</p>
+<ol><li>当前的 MemTable。</li><li>冻结的 MemTable，从新到旧。</li><li>L0 的每一个文件，从新到旧。</li><li>L1、L2……每层最多看一个文件。</li></ol>
+<h3>为什么先找到的一定是最新的</h3>
+<p>因为数据只会从上往下移动：先在内存表，flush 后到 L0，之后被合并到 L1、L2……。所以对同一个 key 来说，位置越靠上的版本越新。从上到下遇到的第一个版本就是最新版本，不用再往下看。如果第一个遇到的是删除标记，答案就是"不存在"，同样不用再往下看。</p>
+<h3>为什么 L0 要逐个文件看，而下面的层只看一个文件</h3>
+<p>L0 的文件是 flush 直接产生的，每个文件装的是当时内存表里的数据，key 可能遍布整个范围，所以 L0 的文件之间 key 范围互相重叠，目标可能在其中任何一个里，只能逐个检查。</p>
+<p>L1 及以下的文件是合并整理过的：同一层里各个文件的 key 范围互不重叠，并且按顺序排列。所以只要对各文件的起止 key 做一次二分，就能确定目标只可能在哪一个文件里。（第 6 章说明合并如何保持这个性质。）</p>
+<h3>在单个文件里怎样少读</h3>
+<p>确定了要看某个文件之后，按第 3 章的方法依次做四道检查，前两道不需要读数据：</p>
+<ol><li><b>key 范围：</b>每个文件的最小和最大 key 记在内存里。目标不在范围内，直接跳过。</li><li><b>Bloom filter：</b>判定"一定不在"，直接跳过。</li><li><b>目录（index block）：</b>二分，找到唯一可能的 data block。</li><li><b>data block：</b>读进来查找。</li></ol>
+<p>第 4 步是真正读磁盘的地方。为了少读，RocksDB 把最近读过的 block 留在内存里，这块内存叫 <b>block cache</b>。它的容量有限，放满后丢掉最久没有被用到的 block。再次需要同一个 block 时直接从内存取。</p>
+
 <h2>实验：跟踪一次 Get</h2>
 <p>数据库里预先写入了偶数编号的 key（k000、k002、…、k398），所以任何奇数 key 都不存在。k120 已被删除。蓝色竖线标出目标 key 的位置。</p>`);
-    const B = U.bench('Get 的查找过程', { opts: readOpts, setup: readSetup, view: { keySpace: 400 }, log: false });
+    const B = U.bench('Get 的查找过程', { opts: readOpts, setup: readSetup, view: { keySpace: 400, plain: true, legend: '<span><i></i>SST 文件（横向位置和宽度 = 它包含的 key 范围）</span><span><i style="border-style:dashed;border-color:var(--muted);background:var(--surface)"></i>已排除，没有读数据</span><span><i style="border-color:var(--probe);background:var(--probe-soft)"></i>正在检查 / 读了 data block</span><span><i style="border-color:var(--out);background:var(--out-soft)"></i>找到</span><span><i style="border-color:var(--bad);background:var(--bad-soft)"></i>遇到删除标记</span>' }, log: false });
     const kIn = B.input('key', '86', 56); const stepBox = h('div'), cacheBox = h('div'); add(B.extra, [stepBox, cacheBox]);
     B.onRefresh = () => { const db = B.lab.db; cacheBox.innerHTML = `<span style="font-size:12.5px;color:var(--ink2)">block cache（容量 ${db.o.block_cache_blocks} 个 block，LRU，右边最新）：</span> <span class="mono" style="font-size:12px">${[...db.cache.keys()].map((k) => '#' + k.replace(':', '/D')).join('  ') || '空'}</span>`; };
     const doGet = (k) => {
@@ -1685,13 +1721,16 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
 <h2>单个文件内的四道检查</h2>
 <ol>
 <li><b>key 范围。</b>每个文件的最小和最大 key 记录在 MANIFEST 中并常驻内存。目标不在范围内就直接跳过，没有任何 IO。L1 及以下通过对文件边界二分来完成这一步。</li>
-<li><b>Bloom filter。</b>判定不存在就跳过。filter 本身也是一个 block，默认常驻 table reader 的内存，也可以配置为放进 block cache（<code>cache_index_and_filter_blocks</code>）。</li>
+<li><b>Bloom filter。</b>判定不存在就跳过。filter 和目录默认在文件打开后一直留在内存里；内存紧张时可以配置成和 data block 一样放进 block cache，按需加载（<code>cache_index_and_filter_blocks</code>）。</li>
 <li><b>index block。</b>二分找到唯一可能包含目标的 data block。</li>
 <li><b>data block。</b>先查 block cache，未命中则读盘、校验、解压并放入 cache，然后在 block 内查找（第 3 章）。</li>
 </ol>
-<p>最坏情况下，一次点查要对每个 L0 文件和每个非空层各做一次这样的检查。这就是读放大与 sorted run 个数相关的原因，也是 L0 文件数必须受控的原因之一。</p>
+<p>最坏情况下，一次点查要对每个 L0 文件和每个非空的层各做一次这样的检查。所以要检查的地方的个数 = L0 文件数 + 非空层数。这就是第 1 章说的读放大，也是 L0 文件数必须受控的原因之一。</p>
 <h2>实验：Bloom filter 的效果</h2>
-<p>下面对同一份数据用不同的 <code>bits_per_key</code> 重建数据库，然后查询 600 个不存在的 key。理论假阳性率按 (1 − e<sup>−k/b</sup>)<sup>k</sup> 计算，其中 b 是 bits_per_key，k 是哈希个数。</p>`);
+<p>先说它的原理。Bloom filter 是一串二进制位，开始时全是 0。生成文件时，对文件里的每个 key 用几个不同的哈希函数算出几个位置，把这些位置设为 1。查询时对目标 key 算出同样的几个位置：</p>
+<ul><li>只要有一个位置是 0，这个 key 一定没有被写进过文件。</li><li>如果全是 1，这个 key 可能在文件里；也可能不在，只是别的 key 碰巧把这几个位置都设成了 1。后一种情况叫<b>假阳性</b>（误报），后果只是白读一个 block，不影响结果的正确性。</li></ul>
+<p>位数越多，碰巧全是 1 的概率越低。衡量位数的参数是"平均每个 key 分到几位"，即 <code>bits_per_key</code>。</p>
+<p>下面对同一份数据用不同的 <code>bits_per_key</code> 重建数据库，然后查询 600 个不存在的 key，统计每次查询读了几个 block。表中的"理论假阳性率"是按公式 (1 − e<sup>−k/b</sup>)<sup>k</sup> 算的，b 是 bits_per_key，k 是每个 key 设置的位置个数。</p>`);
     const fpBox = h('div');
     add(root, h('div', { class: 'lab' }, h('div', { class: 'lab-title' }, h('span', { class: 'tag' }, '实验'), '查询不存在的 key 的开销'), h('div', { class: 'bar' }, h('button', { class: 'pri', onclick: () => {
       const rows = [];
@@ -1707,8 +1746,8 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
     } }, '运行实验')), fpBox));
     prose(root, `
 <h2>迭代器</h2>
-<p>范围扫描不能像点查那样找到就停，因为下一个 key 可能在任何一个 sorted run 里。RocksDB 为每个 sorted run 建一个子迭代器（MemTable 一个、每个 L0 文件一个、L1 及以下每层一个），用 <code>MergingIterator</code> 把它们归并：每次取所有子迭代器当前元素中内部 key 最小的那个，内部用最小堆实现。</p>
-<p>归并得到的是内部 key 的有序流，其中包含旧版本和 tombstone。上层的 <code>DBIter</code> 负责把它变成用户看到的结果：对每个 user key 只取对当前 snapshot 可见的最新版本；如果它是 tombstone，就跳过这个 key 的所有版本。</p>
+<p>范围扫描不能像点查那样找到就停，因为"下一个 key"可能在任何一个地方。先引入一个词：一组内部按 key 有序的数据叫一个 <b>sorted run</b>。MemTable 是一个 sorted run，每个 L0 文件各是一个，L1 及以下每一层整体算一个（层内文件互不重叠，首尾相接就是一个有序序列）。RocksDB 为每个 sorted run 建一个子迭代器，用 <code>MergingIterator</code> 把它们归并：每次取所有子迭代器当前元素中内部 key 最小的那个，内部用最小堆实现。</p>
+<p>归并得到的是内部 key 的有序流，其中包含旧版本和 tombstone。上层的 <code>DBIter</code> 负责把它变成用户看到的结果：对每个 key 只取最新的那个版本（如果这次读指定了一个较早的时间点，就取那个时间点能看到的最新版本，见第 5 章）；如果它是 tombstone，就跳过这个 key 的所有版本。</p>
 <p>下面的实验使用与上面相同的数据。表中每一行是一个子迭代器和它当前指向的内部 key。</p>`);
     const ilab = new U.Lab(readOpts, readSetup); let it = null; const out = []; const itBox = h('div'), itMsg = h('div', { class: 'out' });
     const drawIt = () => {
@@ -1738,14 +1777,36 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
   // ================= 5. 版本与快照 =================
   CH.push({ id: 'version', n: '5', title: '版本、快照与恢复', quizN: 4, render(root) {
     prose(root, `
-<p class="lead">SST 文件不可变，但"哪些文件属于哪一层"一直在变。这一章说明 RocksDB 如何记录这个变化、如何让正在进行的读不受影响，以及崩溃后如何恢复。</p>
-<h2>Version 与 MANIFEST</h2>
-<p>一个 <b>Version</b> 是某一时刻各层文件列表的完整描述，创建后不再改变。每次 flush 或 compaction 完成时，RocksDB 生成一个 <b>VersionEdit</b>（"在 Lx 加入这些文件，从 Ly 删除那些文件"），把它应用到当前 Version 得到新的 Version，并把这个 VersionEdit 追加到 <b>MANIFEST</b> 文件。MANIFEST 就是 VersionEdit 的日志；启动时从头重放即可恢复文件列表。</p>
-<p>读操作开始时取得当前 <b>SuperVersion</b> 的引用。SuperVersion 把当前的 MemTable、immutable MemTable 列表和 Version 打包在一起。只要引用还在，其中的文件就不会被删除，即使 compaction 已经用新文件取代了它们。</p>
-<h2>Snapshot</h2>
-<p>Snapshot 只是一个 sequence number。带 snapshot 的读会忽略所有 seq 更大的版本。它不复制数据，也不固定文件，但它对 compaction 有影响：compaction 不能丢弃某个 snapshot 仍然需要的旧版本。</p>
-<p>具体规则：把所有活跃的 snapshot 按 seq 排序，它们把 seq 轴切成若干段。对同一个 key，每一段内只需要保留最新的一个版本，因为落在同一段内的两个版本对任何 snapshot 来说都无法区分。没有 snapshot 时只有一段，每个 key 只保留最新版本。</p>
-<h2>实验</h2>`);
+<p class="lead">每个 SST 文件写完后不再改变，但"数据库现在由哪些文件组成"一直在变：flush 会增加文件，compaction 会用新文件替换旧文件。这一章回答由此产生的四个问题。</p>
+
+<h2>问题一：数据库怎么记住"现在有哪些文件、各在哪一层"</h2>
+<p>数据目录里只是一堆 <code>.sst</code> 文件。光看文件名，看不出哪个文件属于哪一层，也分不清哪些是有效的、哪些是合并到一半时留下的。必须有一份记录。</p>
+<p>最直接的想法是维护一个"文件列表"文件，每次变化就重写它。但重写到一半断电，列表就坏了。RocksDB 用的还是"只追加"的办法：每次 flush 或 compaction 完成，就在一个日志文件末尾追加一条记录，内容是"在 L1 加入文件 12、13；从 L0 删除文件 7、8、9"这样的变更。</p>
+<ul><li>这样的一条变更记录叫 <b>VersionEdit</b>。</li><li>存放这些记录的日志文件叫 <b>MANIFEST</b>。</li></ul>
+<p>启动时把 MANIFEST 从头到尾重放一遍，就得到当前的文件列表。一次 compaction 的"加入新文件"和"删除旧文件"写在同一条记录里，所以要么都生效，要么都不生效，不会停在中间状态。</p>
+
+<h2>问题二：读到一半，要读的文件被 compaction 换掉了怎么办</h2>
+<p>一次查找或扫描需要一段时间。在这期间 compaction 可能刚好完成，把它正要读的文件替换成了新文件。旧文件此时不能删除，否则这次读就失败了。</p>
+<p>RocksDB 的做法是把"某一时刻的文件列表"做成一个<b>不可修改的对象</b>，叫一个 <b>Version</b>。每来一条 VersionEdit，不是去修改当前的 Version，而是生成一个新的 Version。读操作开始时拿住当时的 Version，读完再放开。一个文件只有在不被任何还在使用的 Version 引用时，才会从磁盘上删除。</p>
+<p>读操作除了文件，还要看当前的 MemTable 和冻结的 MemTable。RocksDB 把"当前 MemTable、冻结的 MemTable 列表、当前 Version"打包成一个对象，叫 <b>SuperVersion</b>，读操作开始时一次拿住它。</p>
+
+<h2>问题三：想让一连串的读看到同一时刻的数据</h2>
+<p>例如备份时要扫描整个数据库，扫描期间写入还在继续。如果扫到前半段时看到的是旧数据、后半段看到的是新数据，备份就不一致。</p>
+<p>第 2 章说过每次写入都有一个递增的 seq。所以"某一时刻"可以用一个数字表示：记下当时最新的 seq，之后读的时候忽略所有 seq 比它大的记录。这个被记下来的 seq 就叫一个 <b>snapshot</b>。它不复制任何数据，创建它几乎没有开销。</p>
+<p>开销出现在 compaction 上。平时 compaction 对每个 key 只保留最新的版本。有 snapshot 时，snapshot 还需要读到的旧版本不能丢。规则是：</p>
+<ul><li>把所有还在使用的 snapshot 的 seq 标在数轴上，它们把数轴切成几段。</li><li>对同一个 key，<b>每一段里只保留最新的一个版本</b>。</li></ul>
+<p>举例：某个 key 有 5 个版本，seq 分别是 3、7、12、18、30；有两个 snapshot，seq 是 10 和 20。</p>
+<div class="tablewrap"><table><thead><tr><th>段</th><th>落在这一段的版本</th><th>保留</th><th>原因</th></tr></thead><tbody>
+<tr><td>seq ≤ 10</td><td>3、7</td><td>7</td><td>snapshot 10 能看到的最新版本是 7；版本 3 没有任何读操作会再看到</td></tr>
+<tr><td>11 ≤ seq ≤ 20</td><td>12、18</td><td>18</td><td>snapshot 20 能看到的最新版本是 18</td></tr>
+<tr><td>seq &gt; 20</td><td>30</td><td>30</td><td>不带 snapshot 的普通读看到它</td></tr></tbody></table></div>
+<p>没有 snapshot 时数轴只有一段，每个 key 只留最新的一个。snapshot 用完必须释放，否则它保护的旧版本会一直被抄进新文件，占用空间。</p>
+
+<h2>问题四：断电之后怎么恢复</h2>
+<p>有了 MANIFEST（记录文件列表）和 WAL（记录还没 flush 的数据），恢复就是把这两份日志依次重放。具体步骤在实验之后说明。</p>
+
+<h2>实验</h2>
+<p>图的看法与第 2 章相同。右下方两个小表分别显示 MANIFEST 里最近的几条 VersionEdit，以及当前有哪些 snapshot 和迭代器。"Compact L0"会把 L0 的全部文件合并到 L1。</p>`);
     const tasks = U.taskList('场景一：snapshot 如何让旧版本留下来', [
       { text: 'Put k010 = v1', check: (B) => B.lab.db.get('k010').value === 'v1' || B.lab.db.seq > 1 },
       { text: '获取一个 snapshot', check: (B) => B.lab.db.snapshots.length > 0 },
@@ -1754,7 +1815,7 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
       { text: '点"用最老的 snapshot 读"，确认读到 v1', check: (B) => B.last && B.last.a.t === 'get' && B.last.a.opt && B.last.r.value === 'v1' },
       { text: '释放 snapshot，再执行"Compact L0"，确认旧版本被丢弃', check: (B) => B.lab.db.snapshots.length === 0 && B.lab.db.stats.compactions > 0 },
     ]);
-    const B = U.bench('snapshot、迭代器与 MANIFEST', { opts: { sim_bg_mode: 'manual', write_buffer_size: 200, num_levels: 4, level_compaction_dynamic_level_bytes: false }, view: { keySpace: 100 }, tasks });
+    const B = U.bench('snapshot、迭代器与 MANIFEST', { opts: { sim_bg_mode: 'manual', write_buffer_size: 200, num_levels: 4, level_compaction_dynamic_level_bytes: false }, view: { keySpace: 100, plain: true }, tasks });
     const kIn = B.input('key', '10', 50), vIn = B.input('value', 'v1', 60); const side = h('div', { class: 'grid2' }); add(B.extra, side);
     B.onRefresh = () => {
       const db = B.lab.db; side.textContent = '';
@@ -1833,7 +1894,7 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
     };
     const say = (s) => { msg.innerHTML = s; };
     const put = (k, v, quiet) => {
-      hl = {}; let note = '';
+      hl = {}; let note = '', flushed = 0;
       if (S.crashed) return say('机器断电了，先点"重启并恢复"。');
       if (f.log || f.wal) S.log.push({ k, v });
       if (f.mem) {
@@ -1841,13 +1902,14 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
         if (i >= 0 && S.mem[i].k === k) S.mem[i] = { k, v }; else if (i < 0) S.mem.push({ k, v }); else S.mem.splice(i, 0, { k, v });
         note = `内存表里按顺序插入 <code>${k}</code>。`;
         if (S.mem.length >= CAP) {
-          S.files.unshift({ id: ++S.fid, rows: S.mem }); S.mem = [];
+          S.files.unshift({ id: ++S.fid, rows: S.mem }); S.mem = []; flushed = S.fid;
           note += `<b>内存表满了</b>：把这 ${CAP} 条按顺序一次写成"有序文件 ${S.fid}"，然后清空内存表。` + (f.wal ? '这些数据已经安全地在有序文件里，日志里对应的内容不再需要，可以清掉。' : '');
           if (f.wal) S.log = [];
         }
       }
       if (!quiet) say((f.log || f.wal ? `在${f.mem ? '日志' : '数据'}文件末尾追加一行 <code>${k}=${v === null ? '✕' : v}</code>。` : '') + note);
       draw();
+      return `<code>${k}=${v === null ? '✕' : v}</code>` + (flushed ? `（这时内存表满了，里面的 ${CAP} 条被写成有序文件 ${flushed}）` : '');
     };
     const get = (k) => {
       hl = {}; if (S.crashed) return say('机器断电了，先点"重启并恢复"。');
@@ -1868,7 +1930,7 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
     const K = () => { const n = parseInt(kIn.value, 10); return isNaN(n) ? null : String(Math.max(0, Math.min(99, n))).padStart(2, '0'); };
     const bar = h('div', { class: 'bar' }, h('label', { for: kIn.id }, 'key', kIn), h('label', { for: vIn.id }, 'value', vIn),
       h('button', { class: 'pri', onclick: () => K() && put(K(), (vIn.value || 'x').slice(0, 3)) }, '写入'),
-      h('button', { onclick: () => { const rng = L.mulberry32(rnd++ * 31 + seed.length); for (let i = 0; i < 3; i++) put(String(Math.floor(rng() * 30)).padStart(2, '0'), 'abcdefgh'[Math.floor(rng() * 8)], true); say('随机写入了 3 条。'); } }, '随机写 3 条'),
+      h('button', { onclick: () => { const rng = L.mulberry32(rnd++ * 31 + seed.length); const ns = []; for (let i = 0; i < 3; i++) ns.push(put(String(Math.floor(rng() * 30)).padStart(2, '0'), 'abcdefgh'[Math.floor(rng() * 8)], true)); if (ns.some(Boolean)) say('电脑随机挑了 3 个 key 和 value，依次写入：' + ns.filter(Boolean).join('；') + '。每一条的处理过程和你手动点"写入"完全一样。'); } }, '自动写 3 条'),
       h('button', { onclick: () => K() && get(K()) }, '查找'));
     if (f.del) add(bar, h('button', { onclick: () => K() && put(K(), null) }, '删除'));
     if (f.compact) add(bar, h('button', { onclick: () => {
@@ -1936,7 +1998,7 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
     prose(root, `
 <p>试一下：</p>
 <ul>
-<li>删除 <code>12</code>，再随机写几条让内存表写满。此时最新的文件里有 <code>12=✕</code>，最老的文件里还有 <code>12=a</code>。查找 <code>12</code>，看它在哪里停下。</li>
+<li>删除 <code>12</code>，再点几次"自动写 3 条"让内存表写满。此时最新的文件里有 <code>12=✕</code>，最老的文件里还有 <code>12=a</code>。查找 <code>12</code>，看它在哪里停下。</li>
 <li>点"合并所有文件"，看有多少条旧值和删除标记被丢掉。再查找一次，对比要查的地方数。</li>
 </ul>
 <p>到这里，你已经搭出了一个完整的 LSM。它的全部规则就是：</p>
@@ -1973,6 +2035,7 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
 
 <h2>和 B+ 树放在一起看</h2>
 <p>现在回到开头的问题。下面把同一组写入同时交给两种结构，比较它们实际写到磁盘上的数据量。</p>
+<p>有两种写入方式可以选："key 分散"指每条数据的 key 在全部 960 个 key 中随机挑，前后两条的 key 通常相距很远；"key 连续"指 key 从小到大依次取。每次点击之后，实验上方会用文字说明这一批写入在两边各自发生了什么。</p>
 <ul>
 <li><b>左边</b>是 B+ 树：96 个页，每页放 10 条记录。每写入 50 条，就把这期间改过的页整页写回磁盘（写回时会闪一下）。</li>
 <li><b>右边</b>是后面各章使用的 LSM 引擎，也就是把你刚才搭的东西加上分层。图里上方的两个框是 WAL 和 MemTable；下面每一行是一层；每个小方块是一个 SST 文件，方块的左右位置和宽度表示它包含的 key 的范围。</li>
@@ -1982,7 +2045,7 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
     const view = new U.LsmView(lab, { keySpace: 960, legend: false, inspector: false, emptyLevels: false, plain: true });
     const bt = { dirty: new Set(), logical: 0, pageBytes: 0, pageWrites: 0, since: 0, cursor: 0 }; const PAGE = 200;
     const pages = h('div', { class: 'pages' }); for (let i = 0; i < 96; i++) add(pages, h('i'));
-    const btStats = h('div', { class: 'stats' }), lsmStats = h('div', { class: 'stats' }); let rs = 1;
+    const btStats = h('div', { class: 'stats' }), lsmStats = h('div', { class: 'stats' }); let rs = 1; const cmpMsg = h('div', { class: 'out' });
     const draw = () => {
       btStats.innerHTML = `<span>你写入的数据 <b>${bt.logical}</b> 字节</span><span>实际写到磁盘 <b>${bt.pageBytes}</b> 字节</span><span>倍数 <b>${bt.logical ? U.fmt(bt.pageBytes / bt.logical, 1) : '0'}</b></span><span>位置分散的页写入 <b>${bt.pageWrites}</b> 次</span>`;
       const s = lab.db.stats, w = s.flushBytes + s.compWriteBytes;
@@ -1990,20 +2053,24 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
       view.render();
     };
     const write = (n, seqMode) => {
-      const rng = L.mulberry32(rs++);
+      const rng = L.mulberry32(rs++); const s0 = Object.assign({}, lab.db.stats), pb0 = bt.pageBytes, pw0 = bt.pageWrites, touched = new Set();
       for (let i = 0; i < n; i++) {
         const k = seqMode ? bt.cursor++ % 960 : Math.floor(rng() * 960);
         lab.db.put(L.fmtKey(k), 'val' + String(i).padStart(5, '0'));
-        bt.logical += 20; bt.dirty.add(Math.floor(k / 10)); bt.since++;
+        bt.logical += 20; bt.dirty.add(Math.floor(k / 10)); touched.add(Math.floor(k / 10)); bt.since++;
         if (bt.since >= 50) { bt.since = 0; bt.pageWrites += bt.dirty.size; bt.pageBytes += bt.dirty.size * PAGE; for (const p of bt.dirty) { const el = pages.children[p]; el.classList.add('hot'); setTimeout(() => el.classList.remove('hot'), 60); } bt.dirty.clear(); }
       }
+      const s1 = lab.db.stats;
+      cmpMsg.innerHTML = `<b>这次写入了 ${n} 条，每条 20 字节，共 ${n * 20} 字节。</b>key 是${seqMode ? '从小到大连续取的' : '在 0–959 之间随机挑的'}。<br>` +
+        `<b>B+ 树：</b>这 ${n} 条落在 ${touched.size} 个不同的页上（一共 96 页，每页 200 字节）。每攒 50 条落一次盘，把改过的页整页写回，这次共写回 ${bt.pageWrites - pw0} 页次，${bt.pageBytes - pb0} 字节。<br>` +
+        `<b>LSM：</b>这 ${n} 条先进内存表。内存表写满了 ${s1.flushes - s0.flushes} 次，每次写成一个新文件，共 ${s1.flushBytes - s0.flushBytes} 字节。后台把文件合并了 ${s1.compactions - s0.compactions} 次，合并时重写了 ${s1.compWriteBytes - s0.compWriteBytes} 字节` + (s1.trivialMoves - s0.trivialMoves ? `；另有 ${s1.trivialMoves - s0.trivialMoves} 次只是把文件挪到下一层，没有重写` : '') + '。';
       draw();
     };
     add(root, h('div', { class: 'lab' }, h('div', { class: 'lab-title' }, h('span', { class: 'tag' }, '动手'), '同一组写入，两种结构各写了多少磁盘'),
       h('div', { class: 'bar' }, h('button', { class: 'pri', onclick: () => write(100, false) }, 'key 分散：写 100 条'), h('button', { onclick: () => write(1000, false) }, 'key 分散：写 1000 条'), h('button', { onclick: () => write(100, true) }, 'key 连续：写 100 条'),
-        h('button', { class: 'ghost', onclick: () => { lab.reset(); Object.assign(bt, { logical: 0, pageBytes: 0, pageWrites: 0, since: 0, cursor: 0 }); bt.dirty.clear(); draw(); } }, '重置')),
-      h('div', { class: 'grid2' },
-        h('div', null, h('h3', { style: 'margin-top:0' }, 'B+ 树'), pages, btStats),
+        h('button', { class: 'ghost', onclick: () => { lab.reset(); Object.assign(bt, { logical: 0, pageBytes: 0, pageWrites: 0, since: 0, cursor: 0 }); bt.dirty.clear(); cmpMsg.innerHTML = ''; draw(); } }, '重置')),
+      cmpMsg, h('div', { class: 'grid2' },
+        h('div', null, h('h3', { style: 'margin-top:0' }, 'B+ 树'), pages, h('div', { style: 'font-size:12px;color:var(--muted);margin:4px 0' }, '每个方格是一页，能放 10 条记录。变色表示这一页刚被整页写回磁盘。'), btStats),
         h('div', null, h('h3', { style: 'margin-top:0' }, 'LSM'), view.el, lsmStats))));
     draw();
     prose(root, `
@@ -2025,6 +2092,7 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
 <p>这三者互相牵制：合并得越勤，文件越少、旧数据越少，读放大和空间放大就低，但写放大高；合并得越少则相反。RocksDB 的大部分参数都是在这三者之间做选择。</p>
 <h2>接下来</h2>
 <p>后面每一章取上面的一个部件，换成 RocksDB 的真实做法来看细节：第 2 章看写入时日志和内存表里具体发生了什么，第 3 章打开一个 SST 文件，第 4 章看查找，第 6 章看分层合并如何选择文件。实验用的引擎按 RocksDB 源码中的规则实现，只是把数据量缩小到能在屏幕上看清（例如内存表上限是 256 字节，真实默认是 64MB）。</p>
+<p>之后如果忘了某个词的意思，可以随时打开左侧目录最下面的"术语表"。</p>
 <h2>自测</h2>`);
     add(root, U.quiz('why-v2', [
       { q: '在第 3 步之后的模型里，一次写入会立刻写磁盘上的哪些东西？', opts: ['只在日志文件末尾追加一行', '日志文件，再加一个有序文件', '找到 key 所在的有序文件并修改它', '什么都不写，全在内存里'], ans: 0, why: '写入只做两件事：日志追加一行（磁盘），内存表插入一条（内存）。有序文件要等内存表写满后才整批生成。' },
@@ -2262,14 +2330,29 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
   // ================= 6. Leveled Compaction =================
   CH.push({ id: 'leveled', n: '6', title: 'Leveled Compaction', quizN: 5, render(root) {
     prose(root, `
-<p class="lead">Leveled 是 RocksDB 的默认策略。除 L0 外，每层是一个 sorted run，每层有目标大小，相邻层相差固定倍数。某层超出目标时，从中选一些文件与下一层重叠的文件合并。这一章让你先预测、再验证每一次 compaction 的选择。</p>
-<h2>三个问题</h2>
-<p>每次调度 compaction，RocksDB 依次回答三个问题：</p>
-<ol><li><b>哪一层？</b>给每层算一个 score，选 score 最高且 ≥ 1 的层。</li><li><b>这一层的哪些文件？</b>L0 取所有互相重叠的文件；其他层按 <code>compaction_pri</code> 选一个文件，再做扩展。</li><li><b>下一层的哪些文件？</b>所有与已选文件 key 范围重叠的文件。</li></ol>
-<h3>score 的计算（静态层大小时）</h3>
-<ul><li>L0：<code>max(文件数 / level0_file_num_compaction_trigger, L0 总大小 / max_bytes_for_level_base)</code>。用文件数是因为每个 L0 文件都增加读放大。</li><li>L1 及以下：<code>本层大小 / 本层目标大小</code>，其中正在参与 compaction 的文件不计入。</li></ul>
-<p>目标大小：L1 为 <code>max_bytes_for_level_base</code>，之后每层乘以 <code>max_bytes_for_level_multiplier</code>。开启动态层大小后公式有变化，本章后半部分说明。下面的实验先使用静态模式（multiplier=4，base=512）。</p>
-<h2>实验：预测下一次 compaction</h2>`);
+<p class="lead">第 1 章最后说过：每次都合并所有文件太贵，所以要把文件分层，每次只合并一小部分。这一章讲 RocksDB 默认的分层合并策略，叫 Leveled compaction。核心问题只有一个：现在应该合并哪些文件。你会先预测，再对照实际的选择。</p>
+<h2>分层的规则</h2>
+<ul>
+<li><b>L0</b> 放 flush 直接产生的文件，文件之间 key 范围互相重叠。</li>
+<li><b>L1 及以下</b>，同一层里的文件 key 范围互不重叠，按 key 顺序排列。把一层里的文件首尾相接，就是一个完整的有序序列，所以每一层整体是一个 sorted run（第 4 章定义过这个词）。</li>
+<li>每一层有一个<b>目标大小</b>。L1 的目标由参数 <code>max_bytes_for_level_base</code> 指定（默认 256MB），之后每层是上一层的 <code>max_bytes_for_level_multiplier</code> 倍（默认 10 倍）：L2 是 2.56GB，L3 是 25.6GB……</li>
+<li>一次 compaction 的动作是：从某一层 Ln 取出一些文件，再取出 Ln+1 中 key 范围与它们重叠的所有文件，把这些文件归并成新文件放进 Ln+1，然后删除参与合并的旧文件。因为把 Ln+1 中重叠的文件都带上了，合并后 Ln+1 仍然不重叠。</li>
+</ul>
+<h2>为什么每层是上一层的 10 倍</h2>
+<p>这个倍数决定了两件事之间的取舍。</p>
+<p><b>倍数大，层数就少。</b>数据从 L0 走到最底层经过的层数少，查找要检查的层也少。</p>
+<p><b>倍数大，每下一层的代价就高。</b>从 Ln 推一个文件到 Ln+1 时，Ln+1 中与它重叠的文件都要重写。Ln+1 的数据量是 Ln 的 10 倍，而两层覆盖的 key 范围差不多，所以 Ln 的一个文件平均对应 Ln+1 的大约 10 个文件。也就是为了推下去 1 份数据，要顺带重写约 10 份。</p>
+<p>倍数小则相反：每次重写得少，但层数多。10 是一个经验上比较均衡的值。第 9 章有实验比较不同的倍数。</p>
+<p>分层还带来一个关于空间的性质：最底层的大小是它上面所有层之和的大约 9 倍，也就是约 90% 的数据在最底层。上面各层里的数据是"还没来得及合并下去的较新版本"，即使它们全部是对最底层已有 key 的覆盖，多占的空间也只有约 10%。</p>
+
+<h2>每次调度要回答的三个问题</h2>
+<ol><li><b>哪一层？</b>给每层算一个分数（score），选分数最高且 ≥ 1 的层。</li><li><b>这一层的哪些文件？</b>L0 取所有互相重叠的文件；其他层按 <code>compaction_pri</code> 选一个文件，再做扩展。</li><li><b>下一层的哪些文件？</b>所有与已选文件 key 范围重叠的文件。</li></ol>
+<h3>score 是什么</h3>
+<p>score 表示"这一层超出允许量多少"：实际量 ÷ 允许量。小于 1 表示还没满；等于 2 表示已经是允许量的两倍。score 最高的层最需要处理。</p>
+<ul><li>L0 的 score = <code>文件数 ÷ level0_file_num_compaction_trigger</code>（默认 4 个文件就触发）。L0 按文件数而不是大小来算，因为 L0 的每个文件在查找时都要检查，文件数直接决定读放大。此外如果 L0 的总大小超过了 L1 的目标，也会按 <code>L0 总大小 ÷ max_bytes_for_level_base</code> 计算，取两者中较大的。</li><li>L1 及以下的 score = <code>本层大小 ÷ 本层目标大小</code>。正在参与 compaction 的文件不计入，避免重复调度。</li></ul>
+<p>上面是固定目标（静态模式）下的公式。RocksDB 现在默认使用动态目标，公式有调整，本章后半部分说明。下面的实验先使用静态模式，倍数设为 4，L1 目标设为 512 字节，这样层次变化更容易看清。</p>
+<h2>实验：预测下一次 compaction</h2>
+<p>图里每层左侧写着"实际大小 / 目标大小"和 score；score ≥ 1 的显示为橙色。图下方的表给出每层 score 的算式。建议先点"直接看答案"看一两次，熟悉之后再用"开始预测"。</p>`);
     const opts = { sim_bg_mode: 'manual', num_levels: 5, level_compaction_dynamic_level_bytes: false, max_bytes_for_level_multiplier: 4, max_bytes_for_level_base: 512, target_file_size_base: 128, write_buffer_size: 128 };
     const setup = (db) => { db.o.sim_bg_mode = 'instant'; U.runWorkload(db, { kind: 'random', n: 460, keySpace: 400, seed: 3 }); db.o.sim_bg_mode = 'manual'; for (let i = 0; i < 4; i++) U.applyAction(db, { t: 'fill', keySpace: 400, seed: 40 + i }); db.events.length = 0; };
     const tasks = U.taskList('练习：', [
@@ -2323,7 +2406,8 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
     prose(root, `
 <p>先只做顺序写，写放大保持在 1 左右（只有 flush 那一次）。重置后只做随机写，写放大明显更高。批量导入数据时先排序，或者直接用 <code>SstFileWriter</code> 生成文件再 ingest，原因就在这里。</p>
 <h2>动态层大小</h2>
-<p><code>level_compaction_dynamic_level_bytes</code> 从 8.4 起默认为 true。静态模式从 L1 开始往下填，各层目标固定；数据量不大时，最底层往往远小于它的目标，导致各层大小不成比例，空间放大偏高。</p>
+<p>上面说"约 90% 的数据在最底层，所以空间浪费只有约 10%"，这有一个前提：各层的实际大小确实成 10 倍关系。静态模式不能保证这一点。举例：目标是 L1 256MB、L2 2.56GB、L3 25.6GB，而数据库一共只有 3GB 数据。这时 L1 和 L2 都装满了，L3 里只有不到 0.2GB，最底层反而比上一层小得多，上层的旧版本无法及时和底层合并，空间浪费就大。</p>
+<p>参数 <code>level_compaction_dynamic_level_bytes</code>（从 8.4 版本起默认开启）解决这个问题。</p>
 <p>动态模式反过来计算：以最底层的<b>实际</b>大小为基准，每往上一层除以 multiplier，得到各层目标；算到目标小于 <code>max_bytes_for_level_base / multiplier</code> 的那层为止，再上面的层不使用。L0 直接合并到第一个被使用的层，称为 <b>base level</b>。这样最底层始终包含约 (multiplier−1)/multiplier 的数据（multiplier=10 时约 90%），稳定状态下空间放大约为 1.11。</p>
 <p>下表用上面第一个实验的当前数据，分别按两种模式计算目标。切换开关后回到实验中观察 base level 的变化。</p>`);
     const dynBox = h('div');
@@ -2333,7 +2417,7 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
     add(root, h('div', { class: 'lab' }, h('div', { class: 'lab-title' }, h('span', { class: 'tag' }, '实验'), '两种模式下的层目标'), h('div', { class: 'bar' }, h('label', { for: 'lv-dyn' }, dynChk, '在上面的实验中启用 level_compaction_dynamic_level_bytes'), h('button', { onclick: drawDyn }, '按当前数据重新计算')), dynBox));
     drawDyn();
     prose(root, `
-<p>动态模式下 score 的公式也做了调整，目的是让优先级反映真实的积压：</p>
+<p><b>以下是进阶内容，第一次读可以跳过。</b>动态模式下 score 的公式也做了调整，目的是让优先级反映真实的积压：</p>
 <ul><li>L0：若 L0 总大小超过 base level 的目标，score 取 <code>L0 大小 / max(base level 实际大小, base level 目标)</code>；score 超过 1 时再乘以 10，保证 L0 优先。</li><li>Ln：未超出目标时仍是 <code>大小 / 目标</code>；超出时为 <code>大小 / (目标 + 上层即将下沉的字节数) × 10</code>。分母加上"上层即将下沉的字节数"，是为了在上层有大量数据要下来时，先处理上层，避免下层空转。</li></ul>
 <div class="note"><b>简化说明</b> 模拟器没有实现：intra-L0 compaction、subcompaction（把一个大 compaction 按 key 范围拆给多个线程）、<code>max_compaction_bytes</code> 对输入和输出文件切分的限制、TTL/periodic compaction、基于 tombstone 的文件大小补偿（compensated size）。选层、选文件、trivial move、动态层大小和 score 公式与源码一致。</div>
 <h2>源码对照</h2>`);
@@ -2353,7 +2437,8 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
     prose(root, `
 <p class="lead">Leveled 用较高的写放大换取低的读放大和空间放大。Universal 反过来：减少重写次数，容忍更多的 sorted run 和更多的临时空间。FIFO 完全不合并，只按总大小淘汰最老的数据。</p>
 <h2>Universal 的模型</h2>
-<p>Universal 把数据看成一列按新旧排序的 <b>sorted run</b>：每个 L0 文件是一个 run，L1 及以下每个非空层是一个 run。compaction 总是合并<b>相邻</b>的若干个 run，结果放回原来的位置，所以 run 之间的新旧顺序不变。</p>
+<p>先说动机。Leveled 每把数据下推一层，都要重写下一层中重叠的部分，同一份数据在到达底层之前被重写很多次。如果写入量很大、磁盘写入能力是瓶颈，这个代价就太高。Universal 的思路是：不强求每层内部整齐，只在"有序的数据段太多"或"浪费的空间太多"时才合并，并且尽量合并大小相近的段，这样每份数据被重写的次数少。</p>
+<p>Universal 把数据看成一列按新旧排序的 <b>sorted run</b>（一组内部有序的数据，第 4 章定义过）：每个 L0 文件是一个 run，L1 及以下每个非空层是一个 run。compaction 总是合并<b>相邻</b>的若干个 run，结果放回原来的位置，所以 run 之间的新旧顺序不变。</p>
 <p>当 run 的个数达到 <code>level0_file_num_compaction_trigger</code> 时开始检查，按以下顺序，第一个满足的生效：</p>
 <ol>
 <li><b>空间放大。</b>若"除最老 run 以外所有 run 的总大小" ÷ "最老 run 的大小" ≥ <code>max_size_amplification_percent</code>（默认 200%），合并全部 run。这是一次全量 compaction。</li>
@@ -2415,7 +2500,7 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
 <li>只保留最新的版本，其余丢弃。</li>
 <li>如果最新版本是 tombstone：只有当<b>输出层以下的所有层都不包含这个 key</b> 时才能丢弃；否则必须保留，因为下层可能还有它要遮蔽的旧值。</li>
 </ol>
-<p>第 2 条的判断是按 key 做的（<code>KeyNotExistsBeyondOutputLevel</code>），检查的是下层文件的 key 范围，不读文件内容。有 snapshot 时，上面的"最新版本"改为"每个 snapshot 区间内的最新版本"（第 5 章），并且 tombstone 必须对最老的 snapshot 可见才能丢弃。</p>
+<p>第 2 条为什么这么严格：如果下面某一层还有这个 key 的旧值，而 tombstone 被提前丢掉，那个旧值就会重新被读到，相当于删除失效了。这个判断是按 key 做的，只检查下层各文件的 key 范围是否包含它，不读文件内容。有 snapshot 时，上面的"最新版本"改为"每个 snapshot 区间内的最新版本"（第 5 章），并且 tombstone 必须对最老的 snapshot 可见才能丢弃。</p>
 <h2>实验：一个 tombstone 的生命周期</h2>
 <p>数据库的最底层 L3 里预先有 k010–k029 共 20 条数据。实验关闭了自动 compaction，每一步由你触发。</p>`);
     const setup = (db) => { for (let i = 10; i < 30; i++) db.put(L.fmtKey(i), 'old' + i); db.flush(); for (let l = 0; l < 3; l++) db.runCompaction(db.pickManual(l)); db.events.length = 0; db.stats = db._zeroStats(); };
@@ -2452,12 +2537,19 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
 <li><b>DeleteRange。</b>对 [k012, k020) 执行 DeleteRange 并 flush。L0 文件里只有一条 range tombstone（文件上边缘有红色双线），却让 8 个 key 不可见。把它 compact 到 L3，观察"被 range tombstone 覆盖的数据"的计数。</li>
 <li><b>Merge。</b>对 k040 连续执行三次 Merge +1 再 Get，看查找如何收集 operand。flush 并 compact 后，operand 被折叠成一个值。</li>
 </ul>
+<h2>为什么除了 Delete 还有另外三种操作</h2>
+<p>它们各自针对普通写入和删除的一个不足：</p>
+<ul>
+<li><b>SingleDelete。</b>普通的 tombstone 必须一直下沉到最底部才能清除，因为它不知道下面还有多少个旧版本要遮蔽。如果应用能保证一个 key 在删除之前只被写入过一次（例如二级索引的条目），那么 tombstone 遇到那唯一的一条 Put 时，两者就可以一起丢弃，不必继续下沉。SingleDelete 就是带有这个保证的删除。</li>
+<li><b>DeleteRange。</b>要删除一大段连续的 key 时，逐个写 tombstone 需要先扫描出这些 key，再写入同样多条记录。DeleteRange 只写一条"从 a 到 z 全部删除"的记录。</li>
+<li><b>Merge。</b>有些更新是"在旧值的基础上改"，例如计数器加 1。用普通写入需要先读出旧值、算出新值、再写回，读的那一步很贵。Merge 只写入一条"加 1"这样的修改指令，这条指令叫 <b>operand</b>；真正的计算推迟到读取或 compaction 时再做。</li>
+</ul>
 <h2>四种操作的区别</h2>`);
     add(root, U.table(['操作', '写入的内容', 'compaction 中的处理', '注意'], [
       ['Delete', '一条点 tombstone', '遮蔽更老的版本；到达没有更老数据的位置后丢弃', '删除很多数据后空间不会立即下降，范围扫描要跳过 tombstone'],
       ['SingleDelete', '一条特殊的 tombstone', '遇到紧邻的那一个 Put 时两者一起丢弃，不必下沉到底', '只能用于"自上次删除后恰好 Put 过一次"的 key，否则结果未定义'],
       ['DeleteRange', '一条 range tombstone [start, end)，存在单独的 meta block', '覆盖范围内 seq 更小的数据在合并时被丢弃；自身到达底部后丢弃', '写入代价与范围内 key 的个数无关；读路径要额外检查'],
-      ['Merge', '一条 operand', '相邻 operand 用 PartialMerge 合并；遇到 Put/Delete 或到达底部时用 FullMerge 得到最终值', '实现"读-改-写"而不必先读；operand 堆积会拖慢读'],
+      ['Merge', '一条 operand', '相邻的 operand 先合成一个（例如两个 +1 合成 +2）；遇到基础值（Put 或 Delete）或到达底部时算出最终结果，变成一条普通的 Put', '实现"读-改-写"而不必先读；operand 堆积会拖慢读'],
     ]));
     prose(root, `
 <h2>tombstone 带来的三个问题</h2>
@@ -2487,7 +2579,7 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
   // ================= 9. Write Stall 与放大的取舍 =================
   CH.push({ id: 'stall', n: '9', title: 'Write Stall 与三种放大', quizN: 4, render(root) {
     prose(root, `
-<p class="lead">前面的实验里后台任务都是立即完成的。实际上 flush 和 compaction 有速度上限。当写入速度超过它们的处理能力时，RocksDB 会主动减慢甚至停止写入。这一章让后台任务按速度推进，观察积压如何形成。</p>
+<p class="lead">这一章的主题叫 write stall，意思是 RocksDB 主动让写入变慢或暂停。前面的实验里后台任务都是立即完成的。实际上 flush 和 compaction 有速度上限。当写入速度超过它们的处理能力时，RocksDB 会主动减慢甚至停止写入。这一章让后台任务按速度推进，观察积压如何形成。</p>
 <h2>为什么要限制写入</h2>
 <p>如果不限制，积压会无限增长：immutable MemTable 堆积会耗尽内存；L0 文件堆积会让每次读取要检查的文件越来越多；下层积压会让空间放大失控。RocksDB 的做法是在三个指标上各设两道阈值，先减速、再停止：</p>`);
     add(root, U.table(['原因', '减速条件', '停止条件', '直接含义'], [
@@ -2705,6 +2797,62 @@ make -j db_bench sst_dump ldb
 
 </script>
 <script>
+/* 术语表 */
+(function () {
+  'use strict';
+  const U = window.UI, add = U.add, CH = window.CHAPTERS, prose = window.CHUTIL.prose;
+  const link = (id, n) => `<a href="#${id}">第 ${n} 章</a>`;
+  const TERMS = [
+    ['LSM-tree', '一种存储结构：写入只追加，数据先进内存、再整批写成不可修改的有序文件，靠后台合并来整理', link('why', 1)],
+    ['WAL', '预写日志。每次写入先追加到这里，只用于断电后重建内存表', link('why', 1) + '、' + link('write', 2)],
+    ['MemTable', '内存里的有序表，接收所有新写入', link('why', 1) + '、' + link('write', 2)],
+    ['immutable MemTable', '已经写满、被冻结为只读、等待写成文件的 MemTable', link('write', 2)],
+    ['flush', '把冻结的 MemTable 写成一个 SST 文件', link('why', 1) + '、' + link('write', 2)],
+    ['SST 文件', '磁盘上的有序文件，写完后不再修改', link('why', 1) + '、' + link('sst', 3)],
+    ['compaction', '把若干 SST 文件归并成新文件，丢掉旧版本和删除标记', link('why', 1) + '、' + link('leveled', 6)],
+    ['tombstone', '删除标记。删除一个 key 就是写入一条这样的记录', link('why', 1) + '、' + link('delete', 8)],
+    ['层（L0、L1……）', 'SST 文件的分组。L0 放 flush 的产物，文件之间可以重叠；L1 及以下层内不重叠，每层比上一层大若干倍', link('why', 1) + '、' + link('leveled', 6)],
+    ['写放大', '实际写到磁盘的字节数 ÷ 用户写入的字节数', link('why', 1) + '、' + link('stall', 9)],
+    ['读放大', '查一个 key 需要检查多少个地方', link('why', 1) + '、' + link('read', 4)],
+    ['空间放大', '磁盘占用 ÷ 有效数据量', link('why', 1) + '、' + link('stall', 9)],
+    ['sequence number（seq）', '每次写操作得到的全局递增编号，越大越新', link('write', 2)],
+    ['内部 key', '实际存储的 key：用户的 key + seq + 类型。写作 k005@12', link('write', 2)],
+    ['跳表', 'MemTable 默认使用的有序结构：一条有序链表，加上若干层跨度更大的指针', link('write', 2)],
+    ['fsync', '要求操作系统把文件内容立刻真正写到磁盘的调用', link('write', 2)],
+    ['data block', 'SST 文件里的一段数据（默认约 4KB），是读盘和缓存的单位', link('sst', 3)],
+    ['index block', 'SST 文件里的目录：每个 data block 一行，记着它的 key 上界和位置', link('sst', 3)],
+    ['footer', 'SST 文件最后固定长度的一段，记着目录在哪里', link('sst', 3)],
+    ['前缀压缩', '每个 key 只存与上一个 key 不同的部分', link('sst', 3)],
+    ['restart 点', 'block 内每隔若干条存一个完整的 key，用于二分查找和开始还原', link('sst', 3)],
+    ['Bloom filter', '一小段位数组，能判定"某个 key 一定不在这个文件里"，偶尔会把不在的误判为可能在', link('sst', 3) + '、' + link('read', 4)],
+    ['假阳性', 'Bloom filter 说"可能在"但实际不在。后果是白读一个 block', link('read', 4)],
+    ['block cache', '把最近读过的 data block 留在内存里的缓存', link('read', 4)],
+    ['Get / 点查', '按 key 查一个值', link('read', 4)],
+    ['sorted run', '一组内部按 key 有序的数据：MemTable、每个 L0 文件、L1 及以下的每一层', link('read', 4)],
+    ['迭代器', '按 key 顺序逐条读取的接口，用于范围扫描', link('read', 4)],
+    ['MANIFEST', '记录"哪些文件在哪一层"的变更日志', link('version', 5)],
+    ['VersionEdit', 'MANIFEST 里的一条记录：加入了哪些文件、删除了哪些文件', link('version', 5)],
+    ['Version', '某一时刻的完整文件列表，不可修改', link('version', 5)],
+    ['SuperVersion', '当前 MemTable、冻结的 MemTable 和当前 Version 打包在一起，读操作开始时一次拿住', link('version', 5)],
+    ['snapshot', '一个被记下来的 seq。带着它读时，只看到 seq 不大于它的数据', link('version', 5)],
+    ['score', '一层的"实际量 ÷ 允许量"，≥ 1 表示需要 compaction', link('leveled', 6)],
+    ['base level', '动态层大小模式下，L0 直接合并到的那一层', link('leveled', 6)],
+    ['trivial move', '文件在下一层没有重叠时，只改记录、不重写数据就把它移到下一层', link('leveled', 6)],
+    ['Leveled / Universal / FIFO', '三种 compaction 策略', link('leveled', 6) + '、' + link('universal', 7)],
+    ['SingleDelete', '一种删除：保证 key 此前只写入过一次，遇到那条写入时两者一起丢弃', link('delete', 8)],
+    ['DeleteRange / range tombstone', '用一条记录删除一段连续的 key', link('delete', 8)],
+    ['Merge / operand', 'Merge 写入一条"在旧值上做修改"的指令，这条指令叫 operand', link('delete', 8)],
+    ['write stall', 'flush 或 compaction 跟不上时，RocksDB 主动让写入减速或暂停', link('stall', 9)],
+    ['tick', '模拟器的时间单位。一次写入占 1 个 tick', link('stall', 9)],
+  ];
+  CH.push({ id: 'glossary', n: '词', title: '术语表', quizN: 0, render(root) {
+    prose(root, '<p class="lead">按首次出现的顺序列出本教程用到的词。每个词在正文里第一次出现时都有更完整的解释。</p>');
+    add(root, U.table(['词', '一句话解释', '出现在'], TERMS.map((t) => ['<b>' + t[0] + '</b>', t[1], t[2]])));
+  } });
+})();
+
+</script>
+<script>
 /* 导航与路由 */
 (function () {
   'use strict';
@@ -2718,7 +2866,7 @@ make -j db_bench sst_dump ldb
   }
   function render() {
     const cur = current(), i = CH.indexOf(cur); main.textContent = '';
-    const art = h('article', null, h('h1', null, (cur.n === '★' ? '' : `第 ${cur.n} 章 `) + cur.title));
+    const art = h('article', null, h('h1', null, (isNaN(parseInt(cur.n, 10)) ? '' : `第 ${cur.n} 章 `) + cur.title));
     add(main, art);
     try { cur.render(art); } catch (e) { add(art, h('pre', null, '渲染出错：' + (e && e.stack ? e.stack : e))); }
     add(art, h('div', { class: 'pager' }, i > 0 ? h('a', { href: '#' + CH[i - 1].id }, '← ' + CH[i - 1].title) : h('span'), i < CH.length - 1 ? h('a', { href: '#' + CH[i + 1].id }, CH[i + 1].title + ' →') : h('span')));

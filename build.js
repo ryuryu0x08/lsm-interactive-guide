@@ -3,7 +3,7 @@
 //   index.html          可直接用浏览器打开的完整页面
 const fs = require('fs'), path = require('path');
 const rd = (f) => fs.readFileSync(path.join(__dirname, 'src', f), 'utf8');
-const js = ['engine.js', 'ui.js', 'chapters-a.js', 'chapter-1.js', 'chapter-3.js', 'chapters-b.js', 'main.js'].map((f) => `<script>\n${rd(f).replace(/<\/script/g, '<\\/script')}\n</script>`).join('\n');
+const js = ['engine.js', 'ui.js', 'chapters-a.js', 'chapter-1.js', 'chapter-3.js', 'chapters-b.js', 'glossary.js', 'main.js'].map((f) => `<script>\n${rd(f).replace(/<\/script/g, '<\\/script')}\n</script>`).join('\n');
 const head = `<title>RocksDB LSM 交互教程</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap">

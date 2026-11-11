@@ -21,7 +21,7 @@
     };
     const say = (s) => { msg.innerHTML = s; };
     const put = (k, v, quiet) => {
-      hl = {}; let note = '';
+      hl = {}; let note = '', flushed = 0;
       if (S.crashed) return say('机器断电了，先点"重启并恢复"。');
       if (f.log || f.wal) S.log.push({ k, v });
       if (f.mem) {
@@ -29,13 +29,14 @@
         if (i >= 0 && S.mem[i].k === k) S.mem[i] = { k, v }; else if (i < 0) S.mem.push({ k, v }); else S.mem.splice(i, 0, { k, v });
         note = `内存表里按顺序插入 <code>${k}</code>。`;
         if (S.mem.length >= CAP) {
-          S.files.unshift({ id: ++S.fid, rows: S.mem }); S.mem = [];
+          S.files.unshift({ id: ++S.fid, rows: S.mem }); S.mem = []; flushed = S.fid;
           note += `<b>内存表满了</b>：把这 ${CAP} 条按顺序一次写成"有序文件 ${S.fid}"，然后清空内存表。` + (f.wal ? '这些数据已经安全地在有序文件里，日志里对应的内容不再需要，可以清掉。' : '');
           if (f.wal) S.log = [];
         }
       }
       if (!quiet) say((f.log || f.wal ? `在${f.mem ? '日志' : '数据'}文件末尾追加一行 <code>${k}=${v === null ? '✕' : v}</code>。` : '') + note);
       draw();
+      return `<code>${k}=${v === null ? '✕' : v}</code>` + (flushed ? `（这时内存表满了，里面的 ${CAP} 条被写成有序文件 ${flushed}）` : '');
     };
     const get = (k) => {
       hl = {}; if (S.crashed) return say('机器断电了，先点"重启并恢复"。');
@@ -56,7 +57,7 @@
     const K = () => { const n = parseInt(kIn.value, 10); return isNaN(n) ? null : String(Math.max(0, Math.min(99, n))).padStart(2, '0'); };
     const bar = h('div', { class: 'bar' }, h('label', { for: kIn.id }, 'key', kIn), h('label', { for: vIn.id }, 'value', vIn),
       h('button', { class: 'pri', onclick: () => K() && put(K(), (vIn.value || 'x').slice(0, 3)) }, '写入'),
-      h('button', { onclick: () => { const rng = L.mulberry32(rnd++ * 31 + seed.length); for (let i = 0; i < 3; i++) put(String(Math.floor(rng() * 30)).padStart(2, '0'), 'abcdefgh'[Math.floor(rng() * 8)], true); say('随机写入了 3 条。'); } }, '随机写 3 条'),
+      h('button', { onclick: () => { const rng = L.mulberry32(rnd++ * 31 + seed.length); const ns = []; for (let i = 0; i < 3; i++) ns.push(put(String(Math.floor(rng() * 30)).padStart(2, '0'), 'abcdefgh'[Math.floor(rng() * 8)], true)); if (ns.some(Boolean)) say('电脑随机挑了 3 个 key 和 value，依次写入：' + ns.filter(Boolean).join('；') + '。每一条的处理过程和你手动点"写入"完全一样。'); } }, '自动写 3 条'),
       h('button', { onclick: () => K() && get(K()) }, '查找'));
     if (f.del) add(bar, h('button', { onclick: () => K() && put(K(), null) }, '删除'));
     if (f.compact) add(bar, h('button', { onclick: () => {
@@ -124,7 +125,7 @@
     prose(root, `
 <p>试一下：</p>
 <ul>
-<li>删除 <code>12</code>，再随机写几条让内存表写满。此时最新的文件里有 <code>12=✕</code>，最老的文件里还有 <code>12=a</code>。查找 <code>12</code>，看它在哪里停下。</li>
+<li>删除 <code>12</code>，再点几次"自动写 3 条"让内存表写满。此时最新的文件里有 <code>12=✕</code>，最老的文件里还有 <code>12=a</code>。查找 <code>12</code>，看它在哪里停下。</li>
 <li>点"合并所有文件"，看有多少条旧值和删除标记被丢掉。再查找一次，对比要查的地方数。</li>
 </ul>
 <p>到这里，你已经搭出了一个完整的 LSM。它的全部规则就是：</p>
@@ -161,6 +162,7 @@
 
 <h2>和 B+ 树放在一起看</h2>
 <p>现在回到开头的问题。下面把同一组写入同时交给两种结构，比较它们实际写到磁盘上的数据量。</p>
+<p>有两种写入方式可以选："key 分散"指每条数据的 key 在全部 960 个 key 中随机挑，前后两条的 key 通常相距很远；"key 连续"指 key 从小到大依次取。每次点击之后，实验上方会用文字说明这一批写入在两边各自发生了什么。</p>
 <ul>
 <li><b>左边</b>是 B+ 树：96 个页，每页放 10 条记录。每写入 50 条，就把这期间改过的页整页写回磁盘（写回时会闪一下）。</li>
 <li><b>右边</b>是后面各章使用的 LSM 引擎，也就是把你刚才搭的东西加上分层。图里上方的两个框是 WAL 和 MemTable；下面每一行是一层；每个小方块是一个 SST 文件，方块的左右位置和宽度表示它包含的 key 的范围。</li>
@@ -170,7 +172,7 @@
     const view = new U.LsmView(lab, { keySpace: 960, legend: false, inspector: false, emptyLevels: false, plain: true });
     const bt = { dirty: new Set(), logical: 0, pageBytes: 0, pageWrites: 0, since: 0, cursor: 0 }; const PAGE = 200;
     const pages = h('div', { class: 'pages' }); for (let i = 0; i < 96; i++) add(pages, h('i'));
-    const btStats = h('div', { class: 'stats' }), lsmStats = h('div', { class: 'stats' }); let rs = 1;
+    const btStats = h('div', { class: 'stats' }), lsmStats = h('div', { class: 'stats' }); let rs = 1; const cmpMsg = h('div', { class: 'out' });
     const draw = () => {
       btStats.innerHTML = `<span>你写入的数据 <b>${bt.logical}</b> 字节</span><span>实际写到磁盘 <b>${bt.pageBytes}</b> 字节</span><span>倍数 <b>${bt.logical ? U.fmt(bt.pageBytes / bt.logical, 1) : '0'}</b></span><span>位置分散的页写入 <b>${bt.pageWrites}</b> 次</span>`;
       const s = lab.db.stats, w = s.flushBytes + s.compWriteBytes;
@@ -178,20 +180,24 @@
       view.render();
     };
     const write = (n, seqMode) => {
-      const rng = L.mulberry32(rs++);
+      const rng = L.mulberry32(rs++); const s0 = Object.assign({}, lab.db.stats), pb0 = bt.pageBytes, pw0 = bt.pageWrites, touched = new Set();
       for (let i = 0; i < n; i++) {
         const k = seqMode ? bt.cursor++ % 960 : Math.floor(rng() * 960);
         lab.db.put(L.fmtKey(k), 'val' + String(i).padStart(5, '0'));
-        bt.logical += 20; bt.dirty.add(Math.floor(k / 10)); bt.since++;
+        bt.logical += 20; bt.dirty.add(Math.floor(k / 10)); touched.add(Math.floor(k / 10)); bt.since++;
         if (bt.since >= 50) { bt.since = 0; bt.pageWrites += bt.dirty.size; bt.pageBytes += bt.dirty.size * PAGE; for (const p of bt.dirty) { const el = pages.children[p]; el.classList.add('hot'); setTimeout(() => el.classList.remove('hot'), 60); } bt.dirty.clear(); }
       }
+      const s1 = lab.db.stats;
+      cmpMsg.innerHTML = `<b>这次写入了 ${n} 条，每条 20 字节，共 ${n * 20} 字节。</b>key 是${seqMode ? '从小到大连续取的' : '在 0–959 之间随机挑的'}。<br>` +
+        `<b>B+ 树：</b>这 ${n} 条落在 ${touched.size} 个不同的页上（一共 96 页，每页 200 字节）。每攒 50 条落一次盘，把改过的页整页写回，这次共写回 ${bt.pageWrites - pw0} 页次，${bt.pageBytes - pb0} 字节。<br>` +
+        `<b>LSM：</b>这 ${n} 条先进内存表。内存表写满了 ${s1.flushes - s0.flushes} 次，每次写成一个新文件，共 ${s1.flushBytes - s0.flushBytes} 字节。后台把文件合并了 ${s1.compactions - s0.compactions} 次，合并时重写了 ${s1.compWriteBytes - s0.compWriteBytes} 字节` + (s1.trivialMoves - s0.trivialMoves ? `；另有 ${s1.trivialMoves - s0.trivialMoves} 次只是把文件挪到下一层，没有重写` : '') + '。';
       draw();
     };
     add(root, h('div', { class: 'lab' }, h('div', { class: 'lab-title' }, h('span', { class: 'tag' }, '动手'), '同一组写入，两种结构各写了多少磁盘'),
       h('div', { class: 'bar' }, h('button', { class: 'pri', onclick: () => write(100, false) }, 'key 分散：写 100 条'), h('button', { onclick: () => write(1000, false) }, 'key 分散：写 1000 条'), h('button', { onclick: () => write(100, true) }, 'key 连续：写 100 条'),
-        h('button', { class: 'ghost', onclick: () => { lab.reset(); Object.assign(bt, { logical: 0, pageBytes: 0, pageWrites: 0, since: 0, cursor: 0 }); bt.dirty.clear(); draw(); } }, '重置')),
-      h('div', { class: 'grid2' },
-        h('div', null, h('h3', { style: 'margin-top:0' }, 'B+ 树'), pages, btStats),
+        h('button', { class: 'ghost', onclick: () => { lab.reset(); Object.assign(bt, { logical: 0, pageBytes: 0, pageWrites: 0, since: 0, cursor: 0 }); bt.dirty.clear(); cmpMsg.innerHTML = ''; draw(); } }, '重置')),
+      cmpMsg, h('div', { class: 'grid2' },
+        h('div', null, h('h3', { style: 'margin-top:0' }, 'B+ 树'), pages, h('div', { style: 'font-size:12px;color:var(--muted);margin:4px 0' }, '每个方格是一页，能放 10 条记录。变色表示这一页刚被整页写回磁盘。'), btStats),
         h('div', null, h('h3', { style: 'margin-top:0' }, 'LSM'), view.el, lsmStats))));
     draw();
     prose(root, `
@@ -213,6 +219,7 @@
 <p>这三者互相牵制：合并得越勤，文件越少、旧数据越少，读放大和空间放大就低，但写放大高；合并得越少则相反。RocksDB 的大部分参数都是在这三者之间做选择。</p>
 <h2>接下来</h2>
 <p>后面每一章取上面的一个部件，换成 RocksDB 的真实做法来看细节：第 2 章看写入时日志和内存表里具体发生了什么，第 3 章打开一个 SST 文件，第 4 章看查找，第 6 章看分层合并如何选择文件。实验用的引擎按 RocksDB 源码中的规则实现，只是把数据量缩小到能在屏幕上看清（例如内存表上限是 256 字节，真实默认是 64MB）。</p>
+<p>之后如果忘了某个词的意思，可以随时打开左侧目录最下面的"术语表"。</p>
 <h2>自测</h2>`);
     add(root, U.quiz('why-v2', [
       { q: '在第 3 步之后的模型里，一次写入会立刻写磁盘上的哪些东西？', opts: ['只在日志文件末尾追加一行', '日志文件，再加一个有序文件', '找到 key 所在的有序文件并修改它', '什么都不写，全在内存里'], ans: 0, why: '写入只做两件事：日志追加一行（磁盘），内存表插入一条（内存）。有序文件要等内存表写满后才整批生成。' },

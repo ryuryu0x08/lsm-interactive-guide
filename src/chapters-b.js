@@ -25,14 +25,29 @@
   // ================= 6. Leveled Compaction =================
   CH.push({ id: 'leveled', n: '6', title: 'Leveled Compaction', quizN: 5, render(root) {
     prose(root, `
-<p class="lead">Leveled 是 RocksDB 的默认策略。除 L0 外，每层是一个 sorted run，每层有目标大小，相邻层相差固定倍数。某层超出目标时，从中选一些文件与下一层重叠的文件合并。这一章让你先预测、再验证每一次 compaction 的选择。</p>
-<h2>三个问题</h2>
-<p>每次调度 compaction，RocksDB 依次回答三个问题：</p>
-<ol><li><b>哪一层？</b>给每层算一个 score，选 score 最高且 ≥ 1 的层。</li><li><b>这一层的哪些文件？</b>L0 取所有互相重叠的文件；其他层按 <code>compaction_pri</code> 选一个文件，再做扩展。</li><li><b>下一层的哪些文件？</b>所有与已选文件 key 范围重叠的文件。</li></ol>
-<h3>score 的计算（静态层大小时）</h3>
-<ul><li>L0：<code>max(文件数 / level0_file_num_compaction_trigger, L0 总大小 / max_bytes_for_level_base)</code>。用文件数是因为每个 L0 文件都增加读放大。</li><li>L1 及以下：<code>本层大小 / 本层目标大小</code>，其中正在参与 compaction 的文件不计入。</li></ul>
-<p>目标大小：L1 为 <code>max_bytes_for_level_base</code>，之后每层乘以 <code>max_bytes_for_level_multiplier</code>。开启动态层大小后公式有变化，本章后半部分说明。下面的实验先使用静态模式（multiplier=4，base=512）。</p>
-<h2>实验：预测下一次 compaction</h2>`);
+<p class="lead">第 1 章最后说过：每次都合并所有文件太贵，所以要把文件分层，每次只合并一小部分。这一章讲 RocksDB 默认的分层合并策略，叫 Leveled compaction。核心问题只有一个：现在应该合并哪些文件。你会先预测，再对照实际的选择。</p>
+<h2>分层的规则</h2>
+<ul>
+<li><b>L0</b> 放 flush 直接产生的文件，文件之间 key 范围互相重叠。</li>
+<li><b>L1 及以下</b>，同一层里的文件 key 范围互不重叠，按 key 顺序排列。把一层里的文件首尾相接，就是一个完整的有序序列，所以每一层整体是一个 sorted run（第 4 章定义过这个词）。</li>
+<li>每一层有一个<b>目标大小</b>。L1 的目标由参数 <code>max_bytes_for_level_base</code> 指定（默认 256MB），之后每层是上一层的 <code>max_bytes_for_level_multiplier</code> 倍（默认 10 倍）：L2 是 2.56GB，L3 是 25.6GB……</li>
+<li>一次 compaction 的动作是：从某一层 Ln 取出一些文件，再取出 Ln+1 中 key 范围与它们重叠的所有文件，把这些文件归并成新文件放进 Ln+1，然后删除参与合并的旧文件。因为把 Ln+1 中重叠的文件都带上了，合并后 Ln+1 仍然不重叠。</li>
+</ul>
+<h2>为什么每层是上一层的 10 倍</h2>
+<p>这个倍数决定了两件事之间的取舍。</p>
+<p><b>倍数大，层数就少。</b>数据从 L0 走到最底层经过的层数少，查找要检查的层也少。</p>
+<p><b>倍数大，每下一层的代价就高。</b>从 Ln 推一个文件到 Ln+1 时，Ln+1 中与它重叠的文件都要重写。Ln+1 的数据量是 Ln 的 10 倍，而两层覆盖的 key 范围差不多，所以 Ln 的一个文件平均对应 Ln+1 的大约 10 个文件。也就是为了推下去 1 份数据，要顺带重写约 10 份。</p>
+<p>倍数小则相反：每次重写得少，但层数多。10 是一个经验上比较均衡的值。第 9 章有实验比较不同的倍数。</p>
+<p>分层还带来一个关于空间的性质：最底层的大小是它上面所有层之和的大约 9 倍，也就是约 90% 的数据在最底层。上面各层里的数据是"还没来得及合并下去的较新版本"，即使它们全部是对最底层已有 key 的覆盖，多占的空间也只有约 10%。</p>
+
+<h2>每次调度要回答的三个问题</h2>
+<ol><li><b>哪一层？</b>给每层算一个分数（score），选分数最高且 ≥ 1 的层。</li><li><b>这一层的哪些文件？</b>L0 取所有互相重叠的文件；其他层按 <code>compaction_pri</code> 选一个文件，再做扩展。</li><li><b>下一层的哪些文件？</b>所有与已选文件 key 范围重叠的文件。</li></ol>
+<h3>score 是什么</h3>
+<p>score 表示"这一层超出允许量多少"：实际量 ÷ 允许量。小于 1 表示还没满；等于 2 表示已经是允许量的两倍。score 最高的层最需要处理。</p>
+<ul><li>L0 的 score = <code>文件数 ÷ level0_file_num_compaction_trigger</code>（默认 4 个文件就触发）。L0 按文件数而不是大小来算，因为 L0 的每个文件在查找时都要检查，文件数直接决定读放大。此外如果 L0 的总大小超过了 L1 的目标，也会按 <code>L0 总大小 ÷ max_bytes_for_level_base</code> 计算，取两者中较大的。</li><li>L1 及以下的 score = <code>本层大小 ÷ 本层目标大小</code>。正在参与 compaction 的文件不计入，避免重复调度。</li></ul>
+<p>上面是固定目标（静态模式）下的公式。RocksDB 现在默认使用动态目标，公式有调整，本章后半部分说明。下面的实验先使用静态模式，倍数设为 4，L1 目标设为 512 字节，这样层次变化更容易看清。</p>
+<h2>实验：预测下一次 compaction</h2>
+<p>图里每层左侧写着"实际大小 / 目标大小"和 score；score ≥ 1 的显示为橙色。图下方的表给出每层 score 的算式。建议先点"直接看答案"看一两次，熟悉之后再用"开始预测"。</p>`);
     const opts = { sim_bg_mode: 'manual', num_levels: 5, level_compaction_dynamic_level_bytes: false, max_bytes_for_level_multiplier: 4, max_bytes_for_level_base: 512, target_file_size_base: 128, write_buffer_size: 128 };
     const setup = (db) => { db.o.sim_bg_mode = 'instant'; U.runWorkload(db, { kind: 'random', n: 460, keySpace: 400, seed: 3 }); db.o.sim_bg_mode = 'manual'; for (let i = 0; i < 4; i++) U.applyAction(db, { t: 'fill', keySpace: 400, seed: 40 + i }); db.events.length = 0; };
     const tasks = U.taskList('练习：', [
@@ -86,7 +101,8 @@
     prose(root, `
 <p>先只做顺序写，写放大保持在 1 左右（只有 flush 那一次）。重置后只做随机写，写放大明显更高。批量导入数据时先排序，或者直接用 <code>SstFileWriter</code> 生成文件再 ingest，原因就在这里。</p>
 <h2>动态层大小</h2>
-<p><code>level_compaction_dynamic_level_bytes</code> 从 8.4 起默认为 true。静态模式从 L1 开始往下填，各层目标固定；数据量不大时，最底层往往远小于它的目标，导致各层大小不成比例，空间放大偏高。</p>
+<p>上面说"约 90% 的数据在最底层，所以空间浪费只有约 10%"，这有一个前提：各层的实际大小确实成 10 倍关系。静态模式不能保证这一点。举例：目标是 L1 256MB、L2 2.56GB、L3 25.6GB，而数据库一共只有 3GB 数据。这时 L1 和 L2 都装满了，L3 里只有不到 0.2GB，最底层反而比上一层小得多，上层的旧版本无法及时和底层合并，空间浪费就大。</p>
+<p>参数 <code>level_compaction_dynamic_level_bytes</code>（从 8.4 版本起默认开启）解决这个问题。</p>
 <p>动态模式反过来计算：以最底层的<b>实际</b>大小为基准，每往上一层除以 multiplier，得到各层目标；算到目标小于 <code>max_bytes_for_level_base / multiplier</code> 的那层为止，再上面的层不使用。L0 直接合并到第一个被使用的层，称为 <b>base level</b>。这样最底层始终包含约 (multiplier−1)/multiplier 的数据（multiplier=10 时约 90%），稳定状态下空间放大约为 1.11。</p>
 <p>下表用上面第一个实验的当前数据，分别按两种模式计算目标。切换开关后回到实验中观察 base level 的变化。</p>`);
     const dynBox = h('div');
@@ -96,7 +112,7 @@
     add(root, h('div', { class: 'lab' }, h('div', { class: 'lab-title' }, h('span', { class: 'tag' }, '实验'), '两种模式下的层目标'), h('div', { class: 'bar' }, h('label', { for: 'lv-dyn' }, dynChk, '在上面的实验中启用 level_compaction_dynamic_level_bytes'), h('button', { onclick: drawDyn }, '按当前数据重新计算')), dynBox));
     drawDyn();
     prose(root, `
-<p>动态模式下 score 的公式也做了调整，目的是让优先级反映真实的积压：</p>
+<p><b>以下是进阶内容，第一次读可以跳过。</b>动态模式下 score 的公式也做了调整，目的是让优先级反映真实的积压：</p>
 <ul><li>L0：若 L0 总大小超过 base level 的目标，score 取 <code>L0 大小 / max(base level 实际大小, base level 目标)</code>；score 超过 1 时再乘以 10，保证 L0 优先。</li><li>Ln：未超出目标时仍是 <code>大小 / 目标</code>；超出时为 <code>大小 / (目标 + 上层即将下沉的字节数) × 10</code>。分母加上"上层即将下沉的字节数"，是为了在上层有大量数据要下来时，先处理上层，避免下层空转。</li></ul>
 <div class="note"><b>简化说明</b> 模拟器没有实现：intra-L0 compaction、subcompaction（把一个大 compaction 按 key 范围拆给多个线程）、<code>max_compaction_bytes</code> 对输入和输出文件切分的限制、TTL/periodic compaction、基于 tombstone 的文件大小补偿（compensated size）。选层、选文件、trivial move、动态层大小和 score 公式与源码一致。</div>
 <h2>源码对照</h2>`);
@@ -116,7 +132,8 @@
     prose(root, `
 <p class="lead">Leveled 用较高的写放大换取低的读放大和空间放大。Universal 反过来：减少重写次数，容忍更多的 sorted run 和更多的临时空间。FIFO 完全不合并，只按总大小淘汰最老的数据。</p>
 <h2>Universal 的模型</h2>
-<p>Universal 把数据看成一列按新旧排序的 <b>sorted run</b>：每个 L0 文件是一个 run，L1 及以下每个非空层是一个 run。compaction 总是合并<b>相邻</b>的若干个 run，结果放回原来的位置，所以 run 之间的新旧顺序不变。</p>
+<p>先说动机。Leveled 每把数据下推一层，都要重写下一层中重叠的部分，同一份数据在到达底层之前被重写很多次。如果写入量很大、磁盘写入能力是瓶颈，这个代价就太高。Universal 的思路是：不强求每层内部整齐，只在"有序的数据段太多"或"浪费的空间太多"时才合并，并且尽量合并大小相近的段，这样每份数据被重写的次数少。</p>
+<p>Universal 把数据看成一列按新旧排序的 <b>sorted run</b>（一组内部有序的数据，第 4 章定义过）：每个 L0 文件是一个 run，L1 及以下每个非空层是一个 run。compaction 总是合并<b>相邻</b>的若干个 run，结果放回原来的位置，所以 run 之间的新旧顺序不变。</p>
 <p>当 run 的个数达到 <code>level0_file_num_compaction_trigger</code> 时开始检查，按以下顺序，第一个满足的生效：</p>
 <ol>
 <li><b>空间放大。</b>若"除最老 run 以外所有 run 的总大小" ÷ "最老 run 的大小" ≥ <code>max_size_amplification_percent</code>（默认 200%），合并全部 run。这是一次全量 compaction。</li>
@@ -178,7 +195,7 @@
 <li>只保留最新的版本，其余丢弃。</li>
 <li>如果最新版本是 tombstone：只有当<b>输出层以下的所有层都不包含这个 key</b> 时才能丢弃；否则必须保留，因为下层可能还有它要遮蔽的旧值。</li>
 </ol>
-<p>第 2 条的判断是按 key 做的（<code>KeyNotExistsBeyondOutputLevel</code>），检查的是下层文件的 key 范围，不读文件内容。有 snapshot 时，上面的"最新版本"改为"每个 snapshot 区间内的最新版本"（第 5 章），并且 tombstone 必须对最老的 snapshot 可见才能丢弃。</p>
+<p>第 2 条为什么这么严格：如果下面某一层还有这个 key 的旧值，而 tombstone 被提前丢掉，那个旧值就会重新被读到，相当于删除失效了。这个判断是按 key 做的，只检查下层各文件的 key 范围是否包含它，不读文件内容。有 snapshot 时，上面的"最新版本"改为"每个 snapshot 区间内的最新版本"（第 5 章），并且 tombstone 必须对最老的 snapshot 可见才能丢弃。</p>
 <h2>实验：一个 tombstone 的生命周期</h2>
 <p>数据库的最底层 L3 里预先有 k010–k029 共 20 条数据。实验关闭了自动 compaction，每一步由你触发。</p>`);
     const setup = (db) => { for (let i = 10; i < 30; i++) db.put(L.fmtKey(i), 'old' + i); db.flush(); for (let l = 0; l < 3; l++) db.runCompaction(db.pickManual(l)); db.events.length = 0; db.stats = db._zeroStats(); };
@@ -215,12 +232,19 @@
 <li><b>DeleteRange。</b>对 [k012, k020) 执行 DeleteRange 并 flush。L0 文件里只有一条 range tombstone（文件上边缘有红色双线），却让 8 个 key 不可见。把它 compact 到 L3，观察"被 range tombstone 覆盖的数据"的计数。</li>
 <li><b>Merge。</b>对 k040 连续执行三次 Merge +1 再 Get，看查找如何收集 operand。flush 并 compact 后，operand 被折叠成一个值。</li>
 </ul>
+<h2>为什么除了 Delete 还有另外三种操作</h2>
+<p>它们各自针对普通写入和删除的一个不足：</p>
+<ul>
+<li><b>SingleDelete。</b>普通的 tombstone 必须一直下沉到最底部才能清除，因为它不知道下面还有多少个旧版本要遮蔽。如果应用能保证一个 key 在删除之前只被写入过一次（例如二级索引的条目），那么 tombstone 遇到那唯一的一条 Put 时，两者就可以一起丢弃，不必继续下沉。SingleDelete 就是带有这个保证的删除。</li>
+<li><b>DeleteRange。</b>要删除一大段连续的 key 时，逐个写 tombstone 需要先扫描出这些 key，再写入同样多条记录。DeleteRange 只写一条"从 a 到 z 全部删除"的记录。</li>
+<li><b>Merge。</b>有些更新是"在旧值的基础上改"，例如计数器加 1。用普通写入需要先读出旧值、算出新值、再写回，读的那一步很贵。Merge 只写入一条"加 1"这样的修改指令，这条指令叫 <b>operand</b>；真正的计算推迟到读取或 compaction 时再做。</li>
+</ul>
 <h2>四种操作的区别</h2>`);
     add(root, U.table(['操作', '写入的内容', 'compaction 中的处理', '注意'], [
       ['Delete', '一条点 tombstone', '遮蔽更老的版本；到达没有更老数据的位置后丢弃', '删除很多数据后空间不会立即下降，范围扫描要跳过 tombstone'],
       ['SingleDelete', '一条特殊的 tombstone', '遇到紧邻的那一个 Put 时两者一起丢弃，不必下沉到底', '只能用于"自上次删除后恰好 Put 过一次"的 key，否则结果未定义'],
       ['DeleteRange', '一条 range tombstone [start, end)，存在单独的 meta block', '覆盖范围内 seq 更小的数据在合并时被丢弃；自身到达底部后丢弃', '写入代价与范围内 key 的个数无关；读路径要额外检查'],
-      ['Merge', '一条 operand', '相邻 operand 用 PartialMerge 合并；遇到 Put/Delete 或到达底部时用 FullMerge 得到最终值', '实现"读-改-写"而不必先读；operand 堆积会拖慢读'],
+      ['Merge', '一条 operand', '相邻的 operand 先合成一个（例如两个 +1 合成 +2）；遇到基础值（Put 或 Delete）或到达底部时算出最终结果，变成一条普通的 Put', '实现"读-改-写"而不必先读；operand 堆积会拖慢读'],
     ]));
     prose(root, `
 <h2>tombstone 带来的三个问题</h2>
@@ -250,7 +274,7 @@
   // ================= 9. Write Stall 与放大的取舍 =================
   CH.push({ id: 'stall', n: '9', title: 'Write Stall 与三种放大', quizN: 4, render(root) {
     prose(root, `
-<p class="lead">前面的实验里后台任务都是立即完成的。实际上 flush 和 compaction 有速度上限。当写入速度超过它们的处理能力时，RocksDB 会主动减慢甚至停止写入。这一章让后台任务按速度推进，观察积压如何形成。</p>
+<p class="lead">这一章的主题叫 write stall，意思是 RocksDB 主动让写入变慢或暂停。前面的实验里后台任务都是立即完成的。实际上 flush 和 compaction 有速度上限。当写入速度超过它们的处理能力时，RocksDB 会主动减慢甚至停止写入。这一章让后台任务按速度推进，观察积压如何形成。</p>
 <h2>为什么要限制写入</h2>
 <p>如果不限制，积压会无限增长：immutable MemTable 堆积会耗尽内存；L0 文件堆积会让每次读取要检查的文件越来越多；下层积压会让空间放大失控。RocksDB 的做法是在三个指标上各设两道阈值，先减速、再停止：</p>`);
     add(root, U.table(['原因', '减速条件', '停止条件', '直接含义'], [
