@@ -30,7 +30,8 @@ node build.js              # 把 src/ 内联成 index.html 和 dist/artifact.htm
 | `src/engine.js` | LSM 引擎：写路径、flush、三种 compaction、读路径、快照、write stall、崩溃恢复 |
 | `src/ui.js` | 公共界面组件：LSM 视图、文件检查器、步进器、图表、测验 |
 | `src/chapter-1.js` | 第 1 章（独立的小模型，逐步搭出 LSM） |
-| `src/chapters-a.js` | 第 2–5 章 |
+| `src/chapter-3.js` | 第 3 章（SST 格式，按问题逐步推导） |
+| `src/chapters-a.js` | 第 2、4、5 章 |
 | `src/chapters-b.js` | 第 6–10 章与沙盒 |
 | `src/main.js` | 导航与路由 |
 | `src/style.css` | 样式 |
