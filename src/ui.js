@@ -94,7 +94,7 @@
       const top = h('div', { class: 'lsm-top' });
       if (o.wal) for (const lg of db.logs) {
         const uns = lg.records.filter((r) => !r.synced).length;
-        add(top, h('div', { class: 'box wal' }, h('div', { class: 'ttl' }, 'WAL ' + db._fname(lg.number, 'log')), h('div', { class: 'meta' }, `${lg.records.length} 条记录` + (uns ? ` · ${uns} 条未 fsync` : ''))));
+        add(top, h('div', { class: 'box wal' }, h('div', { class: 'ttl' }, 'WAL ' + db._fname(lg.number, 'log')), h('div', { class: 'meta' }, `${lg.records.length} 条记录` + (uns && !o.plain ? ` · ${uns} 条未 fsync` : ''))));
       }
       if (db.mem) add(top, this._memBox(db.mem, false));
       for (const m of db.imms.slice().reverse()) add(top, this._memBox(m, true));
@@ -107,9 +107,9 @@
       v.levels.forEach((files, i) => {
         if (!files.length && !o.emptyLevels && i > 0) return;
         const size = L.sumSize(files);
-        const head = h('div', { class: 'lvl-head' }, h('b', null, 'L' + i), style === 'leveled' && i === t.baseLevel ? h('span', { class: 'chip base' }, 'base') : null, h('br'),
-          `${files.length} 文件`, h('br'), `${size}` + (style === 'leveled' && i > 0 && t.maxBytes[i] !== Infinity ? ` / ${t.maxBytes[i]}` : '') + ' B',
-          sc[i] && (files.length || i === 0) ? h('span', { class: 'chip' + (sc[i].score >= 1 ? ' hot' : ''), title: 'score = ' + sc[i].formula }, 'score ' + fmt(sc[i].score)) : null);
+        const head = h('div', { class: 'lvl-head' }, h('b', null, 'L' + i), !o.plain && style === 'leveled' && i === t.baseLevel ? h('span', { class: 'chip base' }, 'base') : null, h('br'),
+          `${files.length} 文件`, h('br'), `${size}` + (!o.plain && style === 'leveled' && i > 0 && t.maxBytes[i] !== Infinity ? ` / ${t.maxBytes[i]}` : '') + ' B',
+          !o.plain && sc[i] && (files.length || i === 0) ? h('span', { class: 'chip' + (sc[i].score >= 1 ? ' hot' : ''), title: 'score = ' + sc[i].formula }, 'score ' + fmt(sc[i].score)) : null);
         const body = h('div', { class: 'lvl-body' });
         if (i === 0 || (style !== 'leveled' && i === 0)) { for (const f of files) { const tr = h('div', { class: 'track' }); add(tr, this._fileBox(f)); this._mark(tr); add(body, tr); } if (!files.length) add(body, h('div', { class: 'track' })); }
         else { const tr = h('div', { class: 'track' }); for (const f of files) add(tr, this._fileBox(f)); this._mark(tr); add(body, tr); }

@@ -7,7 +7,7 @@
   function drawToc() {
     const cur = current(); toc.textContent = '';
     add(toc, [h('div', { class: 'brand' }, 'RocksDB LSM 交互教程'), h('div', { class: 'sub' }, '10 章 · 可运行的引擎 · 对照 11.x 源码')]);
-    for (const c of CH) add(toc, h('a', { href: '#' + c.id, class: c === cur ? 'on' : '' }, h('span', { class: 'n' }, c.n), h('span', null, c.title), c.quizN && U.quizDone(c.id, c.quizN) ? h('span', { class: 'ok', title: '自测已完成' }, '✓') : null));
+    for (const c of CH) add(toc, h('a', { href: '#' + c.id, class: c === cur ? 'on' : '' }, h('span', { class: 'n' }, c.n), h('span', null, c.title), c.quizN && U.quizDone(c.quizId || c.id, c.quizN) ? h('span', { class: 'ok', title: '自测已完成' }, '✓') : null));
   }
   function render() {
     const cur = current(), i = CH.indexOf(cur); main.textContent = '';

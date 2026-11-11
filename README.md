@@ -2,7 +2,7 @@
 
 一个单页的交互式教学网页，用一个按 RocksDB（main，11.x）源码规则实现的缩小版 LSM 引擎，逐章讲解并演示：
 
-1. 为什么是 LSM
+1. 从零搭一个 LSM
 2. 写路径：WAL 与 MemTable
 3. SST 文件格式
 4. 读路径：点查与迭代器
@@ -29,7 +29,8 @@ node build.js              # 把 src/ 内联成 index.html 和 dist/artifact.htm
 |---|---|
 | `src/engine.js` | LSM 引擎：写路径、flush、三种 compaction、读路径、快照、write stall、崩溃恢复 |
 | `src/ui.js` | 公共界面组件：LSM 视图、文件检查器、步进器、图表、测验 |
-| `src/chapters-a.js` | 第 1–5 章 |
+| `src/chapter-1.js` | 第 1 章（独立的小模型，逐步搭出 LSM） |
+| `src/chapters-a.js` | 第 2–5 章 |
 | `src/chapters-b.js` | 第 6–10 章与沙盒 |
 | `src/main.js` | 导航与路由 |
 | `src/style.css` | 样式 |
