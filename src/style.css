@@ -256,3 +256,19 @@ input[type=range] { width: 120px; accent-color: var(--accent); }
 @media (max-width: 1000px) { .slgrid { grid-template-columns: minmax(0, 1fr); } }
 .slgrid { grid-template-columns: minmax(0, 1fr); }
 .slsvg { max-width: 860px; }
+
+/* WAL 动画 */
+.walfile { display: flex; flex-direction: column; gap: 3px; overflow-x: auto; padding-bottom: 2px; }
+.walrow { display: flex; gap: 1px; align-items: center; min-width: max-content; }
+.walrow .lb { width: 34px; font-family: var(--mono); font-size: 11px; color: var(--muted); flex: none; }
+.walrow i { width: 19px; height: 22px; flex: none; font-style: normal; font-family: var(--mono); font-size: 10.5px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--line); border-radius: 2px; color: var(--ink); }
+.walrow i.e { border-style: dashed; background: transparent; }
+.walrow i.crc, .walrow i.len, .walrow i.type { background: var(--wal-soft); border-color: var(--wal); }
+.walrow i.type { font-weight: 700; }
+.walrow i.data { background: var(--accent-soft); border-color: var(--accent); }
+.walrow i.pad { background: var(--surface2); color: var(--muted); }
+.walrow i.flip { background: repeating-linear-gradient(135deg, var(--bad-soft) 0 4px, var(--surface) 4px 8px); border-color: var(--bad); color: var(--bad); }
+.walrow i.h-cur { box-shadow: 0 0 0 2px var(--probe); z-index: 1; }
+.walrow i.h-ok { box-shadow: 0 0 0 2px var(--out); z-index: 1; }
+.walrow i.h-bad { box-shadow: 0 0 0 2px var(--bad); z-index: 1; }
+.walrow i.h-pad { box-shadow: 0 0 0 2px var(--muted); z-index: 1; }
